@@ -81,7 +81,7 @@ def load_cases(data_dir: Path) -> list[tuple[str, Path, Path]]:
 def resolve_testdata(explicit: Optional[Path]) -> tuple[Optional[Path], list[Path]]:
     """确定测试数据根目录，返回 (目录, 尝试过的路径)。
 
-    安装到 ~/.local/share/py-judge-runner 后并没有 package/../testData，所以除了
+    安装到 ~/.local/share/roj-local-judge-lite 后并没有 package/../testData，所以除了
     仓库布局，还要在当前目录和其上级找，用户在自己的项目里直接运行就能命中。
     """
     cwd = Path.cwd()

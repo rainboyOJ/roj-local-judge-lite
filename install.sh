@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
 #
 # 带参数（`| bash` 时参数要放在 -s -- 后面）：
-#   curl -fsSL .../install.sh | bash -s -- --ref v0.1.0 --dir /opt/py-judge-runner --force
+#   curl -fsSL .../install.sh | bash -s -- --ref v0.1.0 --dir /opt/roj-local-judge-lite --force
 #
 # 本地运行：
 #   bash install.sh --help
@@ -24,7 +24,7 @@ set -Eeuo pipefail
 
 REPO="rainboyOJ/roj-local-judge-lite"
 REF="master"
-DEST="${HOME:-}/.local/share/py-judge-runner"
+DEST="${HOME:-}/.local/share/roj-local-judge-lite"
 BIN_DIR="${HOME:-}/.local/bin"
 MIRROR="https://gh-proxy.com"
 USE_MIRROR=1
@@ -59,7 +59,7 @@ usage() {
 
 选项：
   --ref <ref>        安装的分支、tag 或 commit（默认 master）
-  --dir <path>       安装目录（默认 ~/.local/share/py-judge-runner）
+  --dir <path>       安装目录（默认 ~/.local/share/roj-local-judge-lite）
   --bin-dir <path>   启动器目录（默认 ~/.local/bin）
   --repo <owner/name> 仓库，便于装自己的 fork（默认 rainboyOJ/roj-local-judge-lite）
   --mirror <prefix>  GitHub 镜像前缀（默认 https://gh-proxy.com）
@@ -137,7 +137,7 @@ clone_repo() {
     return 0
 }
 
-stage="$(mktemp -d "${TMPDIR:-/tmp}/py-judge-runner.XXXXXX")"
+stage="$(mktemp -d "${TMPDIR:-/tmp}/roj-local-judge-lite.XXXXXX")"
 cleanup() { [ -n "${stage:-}" ] && rm -rf "$stage"; }
 trap cleanup EXIT
 
@@ -240,7 +240,7 @@ ok "已安装（$(cd "$DEST" && ls | tr '\n' ' ' | sed 's/ $//')）"
 launcher=""
 if [ "$DO_LAUNCHER" = 1 ]; then
     mkdir -p "$BIN_DIR"
-    launcher="$BIN_DIR/py-judge-runner"
+    launcher="$BIN_DIR/roj-local-judge-lite"
     cat >"$launcher" <<EOF
 #!/bin/sh
 # 由 roj-local-judge-lite 的 install.sh 生成；重新安装会覆盖本文件。
@@ -250,7 +250,7 @@ EOF
     ok "启动器已就绪：$launcher"
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
-        *) warn "$BIN_DIR 不在 PATH 里，把它加进 PATH 后才能在任意目录调用 py-judge-runner" ;;
+        *) warn "$BIN_DIR 不在 PATH 里，把它加进 PATH 后才能在任意目录调用 roj-local-judge-lite" ;;
     esac
 fi
 
@@ -260,10 +260,10 @@ printf '  安装目录  %s\n' "$DEST"
 cat <<EOF
 
 开始评测（在有 testData/ 的项目目录下执行）：
-  py-judge-runner --list                         # 看有哪些题
-  py-judge-runner --pid 1000 solution.cpp        # 评测 C++ 提交
-  py-judge-runner --help                         # 全部参数
+  roj-local-judge-lite --list                         # 看有哪些题
+  roj-local-judge-lite --pid 1000 solution.cpp        # 评测 C++ 提交
+  roj-local-judge-lite --help                         # 全部参数
 
 测试数据不在当前目录时显式指定：
-  py-judge-runner --pid 1000 solution.cpp --testdata /path/to/testData
+  roj-local-judge-lite --pid 1000 solution.cpp --testdata /path/to/testData
 EOF

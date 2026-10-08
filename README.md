@@ -1,8 +1,7 @@
-# py-judge-runner
+# roj-local-judge-lite
 
-Linux 单程序资源执行器：启动已存在的程序，重定向标准流，用 cgroup v2 管理内存，
-用 `wait4` 统计 CPU，用 wall-clock 看门狗防止卡死，最后返回 JSON 结果。
-不编译提交、不比较答案。`OK` 只表示正常执行。
+
+简易评测机
 
 ## 目录
 
@@ -44,13 +43,13 @@ python3 local_judge.py --list                   # 看本地有哪些题
 curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
 ```
 
-装完得到 `~/.local/share/py-judge-runner/` 和启动器 `~/.local/bin/py-judge-runner`
+装完得到 `~/.local/share/roj-local-judge-lite/` 和启动器 `~/.local/bin/roj-local-judge-lite`
 （安装脚本会自己克隆、构建、跑冒烟测试；详细参数见 [安装脚本](#安装脚本)）：
 
 ```bash
 cd 你的项目                # 目录下有 testData/ 就行
-py-judge-runner --list
-py-judge-runner --pid 1000 solution.cpp
+roj-local-judge-lite --list
+roj-local-judge-lite --pid 1000 solution.cpp
 ```
 
 装出来的包不含题目数据，所以测试数据靠自动查找：依次看包上级目录、当前目录、
@@ -341,7 +340,7 @@ root 运行时同样默认降权到 nobody，需保证源文件、可执行文�
 最后安装到用户目录并在 `~/.local/bin` 放一个启动器：
 
 ```bash
-# 默认装 master 到 ~/.local/share/py-judge-runner
+# 默认装 master 到 ~/.local/share/roj-local-judge-lite
 curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
 
 # 带参数：`| bash` 时参数要放在 -s -- 后面
@@ -351,7 +350,7 @@ curl -fsSL <同上> | bash -s -- --ref v0.1.0 --force
 | 参数 | 说明 |
 |---|---|
 | `--ref <ref>` | 安装的分支、tag 或 commit，默认 `master` |
-| `--dir <path>` | 安装目录，默认 `~/.local/share/py-judge-runner` |
+| `--dir <path>` | 安装目录，默认 `~/.local/share/roj-local-judge-lite` |
 | `--bin-dir <path>` | 启动器目录，默认 `~/.local/bin` |
 | `--repo <owner/name>` | 仓库，便于装自己的 fork |
 | `--mirror <prefix>` / `--no-mirror` | 镜像前缀，默认 `https://gh-proxy.com`，直连失败才回退 |
@@ -370,7 +369,7 @@ curl -fsSL <同上> | bash -s -- --ref v0.1.0 --force
 - 目标目录已存在时默认报错退出，加 `--force` 才覆盖。
 
 安装脚本本身也在包里，所以装完可以直接用
-`~/.local/share/py-judge-runner/install.sh` 重装或装到别的目录。
+`~/.local/share/roj-local-judge-lite/install.sh` 重装或装到别的目录。
 
 ## 其他参数
 
