@@ -1,14 +1,16 @@
 # roj-local-judge-lite
 
+## 简要说明
 
-简易评测机
+Linux 下的简单代码评测机：本地编译提交、逐个测试点运行、比对答案，给出
+AC / WA / TLE / MLE / RE 结论。不需要启动 `judge_server`，也不需要预先配好
+cgroup（不可用时会自动降级并明确提示）。
 
 ## 目录
 
+- [简要说明](#简要说明)
 - [快速使用](#快速使用)
-  - [A. 评测我自己的代码](#a-评测我自己的代码最常用)
-  - [B. 当作执行器或库](#b-把-runner-当作执行器或库)
-- [先理解两个限制](#先理解两个限制)
+  - [当作执行器或库](#当作执行器或库)
 - [构建与权限](#构建与权限)
 - [在 macOS 上运行](#在-macos-上运行)
 - [在 Windows 上运行](#在-windows-上运行)
@@ -24,15 +26,10 @@
 
 ## 快速使用
 
-先看你要做哪件事，两条路径互不影响。
-
-### A. 评测我自己的代码（最常用）
-
-不用启 `judge_server`，也不要求事先配好 cgroup。
-
-**方式一：就用本仓库里的这份**
+需要 Linux 系统。克隆后构建一次，就能直接评测：
 
 ```bash
+git clone https://github.com/rainboyOJ/roj-local-judge-lite.git
 cd roj-local-judge-lite
 make                                            # 首次构建 C helper
 python3 local_judge.py --pid 1000 solution.cpp  # 跑 testData/1000/data 下的全部测试点
@@ -41,17 +38,11 @@ python3 local_judge.py --list                   # 看本地有哪些题
 
 macOS 用户请直接看[在 macOS 上运行](#在-macos-上运行)。
 
-**方式二：一行命令装到用户目录，随处可用**
+想装到用户目录、在任意项目里直接调用，克隆后跑一次安装脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
-```
-
-装完得到 `~/.local/share/roj-local-judge-lite/` 和启动器 `~/.local/bin/roj-local-judge-lite`
-（安装脚本会自己克隆、构建、跑冒烟测试；详细参数见 [安装脚本](#安装脚本)）：
-
-```bash
-cd 你的项目                # 目录下有 testData/ 就行
+./install.sh                                    # 默认装到 ~/.local/share/roj-local-judge-lite
+cd 你的项目                                     # 目录下有 testData/ 就行
 roj-local-judge-lite --list
 roj-local-judge-lite --pid 1000 solution.cpp
 ```
@@ -79,7 +70,7 @@ roj-local-judge-lite --pid 1000 solution.cpp
 `systemd-run` 委派 scope，都不可用时降级为 wall 超时加 `RLIMIT_CPU` 并明确提示。
 完整参数见 [local_judge.py 独立使用说明](#local_judgepy-独立使用说明)。
 
-### B. 把 runner 当作执行器或库
+### 当作执行器或库
 
 自己控制输入输出和判定时直接用 `runner.py`。它默认要求**已委派且启用 memory
 controller 的 cgroup v2 父目录**，否则直接返回 `SYSTEM_ERROR`（不会退回无内存
@@ -116,7 +107,7 @@ python3 runner.py --cgroup-root /sys/fs/cgroup/your-delegated-parent \
 ```
 
 也可以在 Python 里当成库调用，见 [Python 接口](#python-接口)。
-注意：只有 A（`local_judge.py`）具备 cgroup 不可用时的自动降级。
+注意：只有 `local_judge.py` 具备 cgroup 不可用时的自动降级。
 `runner.py` 可以显式使用 `--no-cgroup`，库调用则传 `use_cgroup=False`：
 
 ```bash
@@ -125,28 +116,6 @@ python3 runner.py --no-cgroup --input 1.in --output 1.user.out -- ./solution
 
 两种模式都需要构建好的 `runner_helper`。关闭 cgroup 后仍有 CPU、wall、栈、
 输出和进程数限额，但不限制或计量内存，无法判定 MLE。
-
-## 先理解两个限制
-
-**题目阈值用于最终判定，保护上限用于阻止失控。** 两者分开，让稍微超限的程序
-可以完成执行，再根据真实统计判断；严重超限则由内核或看门狗终止。
-
-| 资源 | 默认题目阈值 | 默认保护设置 | 最终判定 |
-|---|---|---|---|
-| CPU | 1000ms | 加 200ms，再向上取整到秒：soft 2秒，hard 3秒 | 原始 CPU 微秒数 > 1000000，或 SIGXCPU → TLE |
-| 内存 | 128MiB | 加 16MiB：`memory.max = 144MiB` | `memory.peak > 128MiB` 或 OOM 事件 → MLE |
-| wall | 独立保护限制 | 默认 CPU 题目阈值 + 500ms，即 1500ms | 看门狗触发 → TLE |
-
-CPU soft 到期发 SIGXCPU，hard 比 soft 多一秒用于兜底。`RLIMIT_CPU` 只支持整数秒，
-所以“200ms 余量”不会产生精确的 1200ms 内核截止时刻。wall 包括 I/O、调度、等待，
-与 CPU 是不同的量；可用 `--wall-time` 单独设置。
-
-内存采用 **cgroup 整个提交的内存口径**，包含后代进程、文件缓存和部分内核内存。
-共享页按内核的归属记账，不是把各进程 RSS 简单相加。关闭本组 swap，避免换出后
-内存计量口径变化。上级 cgroup 的限制仍会生效，应给执行器及各提交留足总资源。
-
-`RLIMIT_AS` 与 `--as-factor` 已删除，避免虚拟地址空间先触顶而使实际内存判定失真。
-`rss_kb` 仍保留作诊断，但不用于 MLE 判定。
 
 ## 构建与权限
 
@@ -445,36 +414,31 @@ root 运行时同样默认降权到 nobody，需保证源文件、可执行文�
 
 ## 安装脚本
 
-`install.sh` 从 GitHub 克隆本仓库、构建 C helper、跑冒烟测试，
-最后安装到用户目录并在 `~/.local/bin` 放一个启动器：
+`install.sh` 把本仓库（脚本所在目录）构建后安装到用户目录，并在 `~/.local/bin`
+放一个启动器。它不访问网络，先克隆再运行：
 
 ```bash
-# 默认装 master 到 ~/.local/share/roj-local-judge-lite
-curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
-
-# 带参数：`| bash` 时参数要放在 -s -- 后面
-curl -fsSL <同上> | bash -s -- --ref v0.1.0 --force
+git clone https://github.com/rainboyOJ/roj-local-judge-lite.git
+cd roj-local-judge-lite
+./install.sh
 ```
 
 | 参数 | 说明 |
 |---|---|
-| `--ref <ref>` | 安装的分支、tag 或 commit，默认 `master` |
 | `--dir <path>` | 安装目录，默认 `~/.local/share/roj-local-judge-lite` |
 | `--bin-dir <path>` | 启动器目录，默认 `~/.local/bin` |
-| `--repo <owner/name>` | 仓库，便于装自己的 fork |
-| `--mirror <prefix>` / `--no-mirror` | 镜像前缀，默认 `https://gh-proxy.com`，直连失败才回退 |
 | `--testdata <path>` | 只用于安装后的冒烟测试 |
 | `--no-build` / `--no-smoke` / `--no-launcher` | 跳过对应步骤 |
 | `-f, --force` | 目标目录已存在时覆盖 |
 
 行为说明：
 
-- **不做交互提问**：`curl | bash` 时 stdin 是脚本本身，所有选择只能由参数决定。
-- **失败不留半个目录**：先在同级暂存目录里克隆、构建、冒烟，全部成功才整体搬进目标目录。
+- **安装源是本目录**：不从网络克隆，装哪个版本由你克隆的分支或 tag 决定。
+- **失败不留半个目录**：先在同级暂存目录里构建、冒烟，全部成功才整体搬进目标目录。
 - **冒烟测试**包含模块导入、`make check`（逻辑用例及无 cgroup 的真实执行）、cgroup 可用性探测，
   以及能找到测试数据时跑一次 `local_judge.py --list`。
 - `make check` 失败会停止安装并保留原安装；只有显式传 `--no-smoke` 才跳过冒烟测试。
-- 需要 `git` 和 `python3 >= 3.8`；构建时还需要 `make` 和一个 C 编译器（`--no-build` 可跳过）。
+- 需要 `python3 >= 3.8`；构建时还需要 `make` 和一个 C 编译器（`--no-build` 可跳过）。
 - `--no-build` 只跳过构建，执行前仍需自行提供与源码配套的 helper；降级模式也需要它。
 - 目标目录已存在时默认报错退出，加 `--force` 才覆盖。
 

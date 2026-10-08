@@ -1,33 +1,28 @@
 #!/usr/bin/env bash
 #
-# roj-local-judge-lite 一键安装脚本
+# roj-local-judge-lite 本地安装脚本
 #
-# 直接从网络安装：
-#   curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
+# 先克隆本仓库，再在仓库目录里运行：
+#   git clone https://github.com/rainboyOJ/roj-local-judge-lite.git
+#   cd roj-local-judge-lite && ./install.sh
 #
-# 带参数（`| bash` 时参数要放在 -s -- 后面）：
-#   curl -fsSL .../install.sh | bash -s -- --ref v0.1.0 --dir /opt/roj-local-judge-lite --force
+# 带参数：
+#   ./install.sh --dir /opt/roj-local-judge-lite --force
 #
-# 本地运行：
-#   bash install.sh --help
-#
-# 说明：本脚本必须支持 `curl | bash`，所以 stdin 是脚本自身，全程不做交互提问，
-# 所有选择都通过命令行参数或环境变量给出。安装过程是「先在同级暂存目录完整构建，
-# 成功后再整体搬进目标目录」，因此失败不会留下半个装好的目录。
+# 说明：安装源就是本脚本所在的仓库目录，不访问网络，装哪个版本由你克隆的分支或
+# tag 决定。整个过程是「先在暂存目录里完整构建并跑冒烟测试，全部成功后再整体搬进
+# 目标目录」，因此失败不会留下半个装好的目录，也不会破坏已有的安装。
 
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "请用 bash 运行本脚本：curl -fsSL <url> | bash" >&2
+    echo "请用 bash 运行本脚本：./install.sh（或 bash install.sh）" >&2
     exit 1
 fi
 
 set -Eeuo pipefail
 
-REPO="rainboyOJ/roj-local-judge-lite"
-REF="master"
+SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${HOME:-}/.local/share/roj-local-judge-lite"
 BIN_DIR="${HOME:-}/.local/bin"
-MIRROR="https://gh-proxy.com"
-USE_MIRROR=1
 DO_BUILD=1
 DO_SMOKE=1
 DO_LAUNCHER=1
@@ -50,20 +45,15 @@ usage() {
     cat <<'USAGE'
 用法：install.sh [选项]
 
-从 GitHub 克隆本仓库，构建 C helper 后安装到用户目录，
-并在 ~/.local/bin 放一个启动器。
+把本仓库（脚本所在目录）构建后安装到用户目录，并在 ~/.local/bin 放一个启动器。
+安装源是本地目录，不访问网络；先克隆再运行：
 
-网络安装：
-  curl -fsSL https://raw.githubusercontent.com/rainboyOJ/roj-local-judge-lite/master/install.sh | bash
-  curl -fsSL <同上> | bash -s -- --ref v0.1.0 --force
+  git clone https://github.com/rainboyOJ/roj-local-judge-lite.git
+  cd roj-local-judge-lite && ./install.sh
 
 选项：
-  --ref <ref>        安装的分支、tag 或 commit（默认 master）
   --dir <path>       安装目录（默认 ~/.local/share/roj-local-judge-lite）
   --bin-dir <path>   启动器目录（默认 ~/.local/bin）
-  --repo <owner/name> 仓库，便于装自己的 fork（默认 rainboyOJ/roj-local-judge-lite）
-  --mirror <prefix>  GitHub 镜像前缀（默认 https://gh-proxy.com）
-  --no-mirror        只直连 GitHub，不自动回退镜像
   --testdata <path>  指定测试数据目录，仅用于安装后的冒烟测试
   --no-build         不构建 runner_helper（跳过 cc/make 依赖）
   --no-smoke         跳过安装后的冒烟测试
@@ -71,18 +61,14 @@ usage() {
   -f, --force        目标目录已存在时直接覆盖
   -h, --help         显示本帮助
 
-依赖：git、python3(>=3.8)，构建时需要 make 和一个 C 编译器。
+依赖：python3(>=3.8)，构建时需要 make 和一个 C 编译器。
 USAGE
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ref) REF="${2:?--ref 需要一个值}"; shift 2 ;;
         --dir) DEST="${2:?--dir 需要一个值}"; shift 2 ;;
         --bin-dir) BIN_DIR="${2:?--bin-dir 需要一个值}"; shift 2 ;;
-        --repo) REPO="${2:?--repo 需要一个值}"; shift 2 ;;
-        --mirror) MIRROR="${2:?--mirror 需要一个值}"; shift 2 ;;
-        --no-mirror) USE_MIRROR=0; shift ;;
         --testdata) TESTDATA="${2:?--testdata 需要一个值}"; shift 2 ;;
         --no-build) DO_BUILD=0; shift ;;
         --no-smoke) DO_SMOKE=0; shift ;;
@@ -99,7 +85,8 @@ done
 # 前置检查
 # ---------------------------------------------------------------------------
 
-command -v git >/dev/null 2>&1 || die "需要 git，请先安装"
+[ -f "$SRC/local_judge.py" ] || die "$SRC 里找不到 local_judge.py，请在本仓库目录内运行 install.sh"
+
 command -v python3 >/dev/null 2>&1 || die "需要 python3，请先安装"
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 8) else 1)' \
     || die "需要 Python 3.8 或更高版本：$(python3 -V 2>&1)"
@@ -114,51 +101,18 @@ if [ "$DO_BUILD" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 下载：先直连，失败再走镜像
+# 复制到暂存目录：在暂存目录里构建和冒烟，成功后才动目标目录
 # ---------------------------------------------------------------------------
-
-sources=("https://github.com/$REPO.git")
-if [ "$USE_MIRROR" = 1 ] && [ -n "$MIRROR" ]; then
-    sources+=("$MIRROR/https://github.com/$REPO.git")
-fi
-
-is_sha() { [[ "$1" =~ ^[0-9a-fA-F]{7,40}$ ]]; }
-
-clone_repo() {
-    local url="$1" dest="$2"
-    rm -rf "$dest"
-    if is_sha "$REF"; then
-        # git clone --branch 不接受裸 commit，只能完整克隆后再 checkout。
-        git clone --quiet "$url" "$dest" 2>/dev/null || return 1
-        git -C "$dest" checkout --quiet "$REF" 2>/dev/null || return 1
-    else
-        git clone --quiet --depth 1 --branch "$REF" "$url" "$dest" 2>/dev/null || return 1
-    fi
-    return 0
-}
 
 stage="$(mktemp -d "${TMPDIR:-/tmp}/roj-local-judge-lite.XXXXXX")"
 cleanup() { [ -n "${stage:-}" ] && rm -rf "$stage"; }
 trap cleanup EXIT
 
-src="$stage/src"
-cloned=0
-for url in "${sources[@]}"; do
-    info "克隆 $REPO（ref=$REF）"
-    if clone_repo "$url" "$src"; then
-        cloned=1
-        break
-    fi
-    warn "克隆失败：$url"
-done
-[ "$cloned" = 1 ] || die "所有下载源都失败，请检查网络，或用 --mirror 指定其他镜像"
-
-[ -f "$src/local_judge.py" ] || die "$REPO 的 $REF 里找不到 local_judge.py，请确认 --ref 是否正确"
-
+info "从 $SRC 复制安装内容"
 pkg="$stage/pkg"
 mkdir -p "$pkg"
-cp -a "$src/." "$pkg/"
-# 克隆下来的 .git、构建产物和缓存都不该跟着安装包走；有就跑一次干净的 make。
+cp -a "$SRC/." "$pkg/"
+# 版本库元数据、构建产物和缓存都不该跟着安装包走；有就跑一次干净的 make。
 rm -rf "$pkg/.git" "$pkg/__pycache__" "$pkg/runner_helper"
 
 if [ "$DO_BUILD" = 1 ]; then

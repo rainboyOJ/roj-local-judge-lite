@@ -1,4 +1,8 @@
-"""离线验证安装流程：替换下载与构建命令，只操作测试自己的临时目录。"""
+"""离线验证安装流程：替换构建命令，只操作测试自己的临时目录。
+
+install.sh 的安装源是脚本所在目录，所以这里先造一份只含必要文件的假源码目录，
+把真实的 install.sh 拷进去运行，保证测的是真正会发布的那份脚本。
+"""
 
 import os
 from pathlib import Path
@@ -16,8 +20,9 @@ class InstallTests(unittest.TestCase):
         self.package = Path(__file__).resolve().parent
         self.source = self.root / "source"
         self.source.mkdir()
-        for name in ("local_judge.py", "runner.py", "memory_cgroup.py"):
+        for name in ("install.sh", "local_judge.py", "runner.py", "memory_cgroup.py"):
             shutil.copyfile(self.package / name, self.source / name)
+        self.installer = self.source / "install.sh"
         self.destination = self.root / "installed"
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -26,13 +31,8 @@ class InstallTests(unittest.TestCase):
         self.stage_dir.mkdir()
         commands = self.root / "commands"
         commands.mkdir()
-        # git 只模拟 clone 的结果，绝不访问网络；make 模拟构建成功及可控的测试结果。
+        # make 模拟构建成功及可控的测试结果，不真的调用编译器。
         scripts = {
-            "git": """#!/bin/bash
-set -eu
-[ "$1" = clone ] || exit 90
-cp -a "$ROJ_TEST_INSTALL_SOURCE" "${@: -1}"
-""",
             "make": """#!/bin/sh
 set -eu
 case "$1" in
@@ -54,12 +54,11 @@ esac
             command.write_text(text)
             command.chmod(0o755)
         self.env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
-                        TMPDIR=str(self.stage_dir), ROJ_TEST_INSTALL_SOURCE=str(self.source),
-                        ROJ_TEST_CHECK_EXIT="42")
+                        TMPDIR=str(self.stage_dir), ROJ_TEST_CHECK_EXIT="42")
 
     def install(self, *options):
         return subprocess.run([
-            "bash", str(self.package / "install.sh"), "--no-mirror",
+            "bash", str(self.installer),
             "--dir", str(self.destination), "--bin-dir", str(self.bin_dir), *options,
         ], cwd=self.root, env=self.env, capture_output=True, text=True, timeout=15)
 
