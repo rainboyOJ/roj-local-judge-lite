@@ -10,6 +10,8 @@
   - [B. 当作执行器或库](#b-把-runner-当作执行器或库)
 - [先理解两个限制](#先理解两个限制)
 - [构建与权限](#构建与权限)
+- [在 macOS 上运行](#在-macos-上运行)
+- [在 Windows 上运行](#在-windows-上运行)
 - [Python 接口](#python-接口)
 - [结果与分类](#结果与分类)
 - [读代码的顺序](#读代码的顺序)
@@ -36,6 +38,8 @@ make                                            # 首次构建 C helper
 python3 local_judge.py --pid 1000 solution.cpp  # 跑 testData/1000/data 下的全部测试点
 python3 local_judge.py --list                   # 看本地有哪些题
 ```
+
+macOS 用户请直接看[在 macOS 上运行](#在-macos-上运行)。
 
 **方式二：一行命令装到用户目录，随处可用**
 
@@ -181,6 +185,111 @@ python3 runner.py --cgroup-root /sys/fs/cgroup/your-delegated-parent \
 
 也可设置环境变量 `ROJ_JUDGE_CGROUP_ROOT`。未指定时使用 `/sys/fs/cgroup/roj-judge`；
 这个默认路径也必须由部署环境预先准备，runner 不会自行配置系统目录。
+
+## 在 macOS 上运行
+
+本仓库依赖 Linux 专有的 `prctl` 与 cgroup v2，在 macOS 上无法直接构建，请用容器运行。
+
+### 1. 安装 Docker 运行时
+
+```bash
+brew install --cask orbstack
+```
+
+装完打开一次 OrbStack 完成初始化。任何兼容 Docker 的运行时都可以，
+Docker Desktop、colima 同样适用。
+
+### 2. 构建镜像
+
+```bash
+cd roj-local-judge-lite
+docker build -t roj-local-judge-lite -f docker/Dockerfile .
+```
+
+镜像里已装好 `g++`、`make`、`python3`。`docker/judge.sh` 首次运行时也会自动构建，
+这一步可以跳过。
+
+### 3. 执行
+
+```bash
+./docker/judge.sh --testdata ~/data/testData --list
+./docker/judge.sh --testdata ~/data/testData --pid 1000 solution.cpp
+```
+
+`~/data/testData` 换成你自己的题目数据目录。提交文件与 `--testdata` 指向的路径
+按宿主机原路径挂进容器，因此参数写法与本地一致。
+
+脚本默认申请 `--privileged`，并在容器内准备启用 memory controller 的 cgroup v2，
+所以内存计量与 MLE 判定是精确的：
+
+```text
+执行 cgroup 隔离，root=/sys/fs/cgroup/judge
+  #1   problem1     MLE       10ms   80.0MiB   内存峰值 80.0MiB
+```
+
+## 在 Windows 上运行
+
+本节命令未在 Windows 上实测。与 macOS 同理，本仓库依赖 Linux 专有的 `prctl` 与
+cgroup v2，在 Windows 上无法直接构建，请用容器运行。`docker/judge.sh` 是 bash 脚本，
+请在 WSL2 里执行。
+
+### 1. 安装 WSL2
+
+以管理员身份打开 PowerShell，然后：
+
+```powershell
+wsl --install
+```
+
+完成后重启电脑。详细步骤见
+[Microsoft 官方文档](https://learn.microsoft.com/windows/wsl/install)。
+
+### 2. 安装 Docker Desktop
+
+```powershell
+winget install --id Docker.DockerDesktop -e
+```
+
+也可以从 [docker.com](https://www.docker.com/products/docker-desktop/) 下载安装包。
+装完启动 Docker Desktop，在 **Settings → Resources → WSL Integration** 里打开你所用发行版的集成。
+
+### 3. 在 WSL 里构建镜像
+
+```bash
+cd ~/roj-local-judge-lite
+docker build -t roj-local-judge-lite -f docker/Dockerfile .
+```
+
+镜像里已装好 `g++`、`make`、`python3`。`docker/judge.sh` 首次运行时也会自动构建，
+这一步可以跳过。
+
+### 4. 执行
+
+```bash
+./docker/judge.sh --testdata ~/data/testData --list
+./docker/judge.sh --testdata ~/data/testData --pid 1000 solution.cpp
+```
+
+`~/data/testData` 换成你自己的题目数据目录。提交文件与 `--testdata` 指向的路径
+按原路径挂进容器，因此参数写法与本地一致。
+
+脚本默认申请 `--privileged`，并在容器内准备启用 memory controller 的 cgroup v2，
+所以内存计量与 MLE 判定是精确的：
+
+```text
+执行 cgroup 隔离，root=/sys/fs/cgroup/judge
+  #1   problem1     MLE       10ms   80.0MiB   内存峰值 80.0MiB
+```
+
+若提示 cgroup 准备失败（Docker Desktop 的 Linux VM 未提供 cgroup v2），改用降级模式，
+它只限 wall 与 CPU，内存显示为 0.0MiB，**MLE 无法判定**：
+
+```bash
+./docker/judge.sh --no-cgroup --testdata ~/data/testData --pid 1000 solution.cpp
+```
+
+仓库请放在 WSL 自己的文件系统（如 `~/roj-local-judge-lite`）而不是 `/mnt/c/...`：
+跨文件系统挂载明显更慢，且能避免文件权限问题。
 
 ## Python 接口
 
@@ -391,6 +500,9 @@ systemd-run --user --scope -p Delegate=yes -- python3 examples/delegated.py make
 
 # 已有委派目录时
 ROJ_JUDGE_CGROUP_ROOT=/path/to/delegated-parent make check
+
+# macOS：在 Linux 容器内跑同一套测试
+make docker-check
 ```
 
 测试覆盖真实 OOM、保护余量内完成后再判超限、微秒/字节边界、瞬时峰值、多个后代的
