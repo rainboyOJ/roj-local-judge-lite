@@ -418,6 +418,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(error, file=sys.stderr)
         return 2
 
+    # 查找失败会返回 None；先给出尝试过的目录，再退出，不能直接拼接题号。
+    if testdata_root is None:
+        return report_missing_testdata(tried)
+
     problem_dir = testdata_root / args.pid
     data_dir = problem_dir / "data"
     if not data_dir.is_dir():

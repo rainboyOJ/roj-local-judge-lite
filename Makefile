@@ -9,7 +9,7 @@ runner_helper: runner_helper.c
 	$(CC) $(CFLAGS) $< -o $@
 
 check: runner_helper
-	python3 -m unittest -v test_runner.py
+	python3 -m unittest -v test_runner.py test_install.py
 
 clean:
 	rm -f runner_helper

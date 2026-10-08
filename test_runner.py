@@ -1,5 +1,6 @@
 """资源执行器的行为回归测试：make check；不需要 OJ 数据或 judge_server。"""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -10,8 +11,10 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
+import local_judge
 from runner import CaseResult, Limits, Verdict, _set_verdict, run_case
 
 
@@ -370,6 +373,27 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
 
 
 class LocalJudgeTests(unittest.TestCase):
+    def test_missing_testdata_reports_search_paths(self):
+        with tempfile.TemporaryDirectory(prefix="local-judge-test-") as directory:
+            root = Path(directory)
+            source = root / "solution.py"
+            source.write_text("print(3)\n")
+            tried = [root / "testData", root / "another" / "testData"]
+            # 固定查找结果，避免测试意外使用开发机器上其他目录的题目数据。
+            with patch.object(local_judge, "resolve_testdata", return_value=(None, tried)), \
+                    patch.object(local_judge, "run_case") as run:
+                for args in (["--pid", "1000", str(source)], ["--list"]):
+                    with self.subTest(args=args):
+                        error = io.StringIO()
+                        with redirect_stderr(error):
+                            exit_code = local_judge.main(args)
+                        self.assertEqual(exit_code, 2)
+                        self.assertIn("找不到测试数据目录", error.getvalue())
+                        self.assertIn("--testdata", error.getvalue())
+                        for path in tried:
+                            self.assertIn(str(path), error.getvalue())
+                run.assert_not_called()
+
     def test_degraded_cli_verdicts_and_automatic_fallback(self):
         # 用一题一测试点贯通“编译 → 统一执行器 → 比对 → 汇总”。
         # 既检查显式 --no-cgroup，也检查指定的 cgroup 不可用时 CLI 的自动降级。

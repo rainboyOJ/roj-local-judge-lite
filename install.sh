@@ -186,8 +186,9 @@ if [ "$DO_SMOKE" = 1 ]; then
         if ( cd "$pkg" && make check >"$stage/check.log" 2>&1 ); then
             ok "单元测试通过：$(grep -E '^Ran ' "$stage/check.log" | tail -1)"
         else
-            warn "make check 未通过，建议排查："
+            # 验证失败时退出，让 EXIT trap 清理暂存目录；此时尚未改动旧安装。
             tail -n 15 "$stage/check.log" >&2
+            die "make check 未通过，已停止安装"
         fi
     fi
 
