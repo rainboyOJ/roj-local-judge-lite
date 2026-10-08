@@ -460,5 +460,39 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(result.verdict, Verdict.MLE)
 
 
+class BundledTestDataTests(unittest.TestCase):
+    """仓库自带 testData/1000、1005 作为默认示例数据，要能从包外找到。"""
+
+    def chdir_elsewhere(self):
+        """切到一个没有 testData/ 的空目录，并在结束时恢复。"""
+        previous = os.getcwd()
+        directory = tempfile.TemporaryDirectory(prefix="local-judge-cwd-")
+        try:
+            os.chdir(directory.name)
+            yield Path(directory.name)
+        finally:
+            os.chdir(previous)
+            directory.cleanup()
+
+    def test_bundled_testdata_found_from_other_directory(self):
+        # 装到 ~/.local/share 后并没有包上级的 testData/，必须能回退到包内自带的那份。
+        for _ in self.chdir_elsewhere():
+            root, tried = local_judge.resolve_testdata(None)
+            self.assertIsNotNone(root, f"未找到包内自带测试数据：{tried}")
+            self.assertEqual(root, local_judge.PACKAGE_DIR / "testData")
+            self.assertTrue((root / "1000" / "data").is_dir())
+            self.assertTrue((root / "1005" / "data").is_dir())
+
+    def test_own_testdata_shadows_bundled(self):
+        # 用户自己项目里的 testData/ 优先，包内示例题不能把它顶掉。
+        for directory in self.chdir_elsewhere():
+            own = directory / "testData" / "2000" / "data"
+            own.mkdir(parents=True)
+            (own / "problem1.in").write_text("1\n")
+            (own / "problem1.out").write_text("1\n")
+            root, _ = local_judge.resolve_testdata(None)
+            self.assertEqual(root, directory / "testData")
+
+
 if __name__ == "__main__":
     unittest.main()

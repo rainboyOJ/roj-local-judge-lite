@@ -6,6 +6,9 @@ Linux 下的简单代码评测机：本地编译提交、逐个测试点运行�
 AC / WA / TLE / MLE / RE 结论。不需要启动 `judge_server`，也不需要预先配好
 cgroup（不可用时会自动降级并明确提示）。
 
+仓库自带两道示例题（`1000` A+B问题、`1005` 地球人口承载力估计，各 10 个测试点），
+克隆后可以直接用它们试跑，也可以换成自己的 `testData/`。
+
 ## 目录
 
 - [简要说明](#简要说明)
@@ -47,8 +50,9 @@ roj-local-judge-lite --list
 roj-local-judge-lite --pid 1000 solution.cpp
 ```
 
-装出来的包不含题目数据，所以测试数据靠自动查找：依次看包上级目录、当前目录、
-当前目录的上级，都没有就用 `--testdata` 指定。
+测试数据靠自动查找：先看当前目录及其上级（你自己项目里的 `testData/` 优先），
+再退回包内自带的示例数据，都没有就用 `--testdata` 指定。所以装到用户目录后，
+在任意目录都能直接评测包里那两道示例题。
 
 上面两种方式的输出一样：
 
@@ -373,7 +377,7 @@ cgroup 需要外部隔离。CPU 仍由直接子进程的 `wait4`/`RLIMIT_CPU` �
 ### 基本用法
 
 ```bash
-# 默认在仓库的 testData/ 下找题目 1000 的数据（相对本目录即 ../testData）
+# 默认找当前目录下的 testData/（仓库里就是自带的那两道示例题）
 python3 local_judge.py --pid 1000 solution.cpp
 
 # 指定测试数据目录
@@ -392,7 +396,7 @@ python3 local_judge.py --list
 |---|---|
 | `--pid <编号>` | 题目编号，对应 `testData/<pid>/data` |
 | `--list` | 列出可用题目、测试点数量与限制 |
-| `--testdata <dir>` | 测试数据根目录，默认本目录的 `../testData` |
+| `--testdata <dir>` | 测试数据根目录，默认依次找 `./testData`、`./../testData`、包内 `testData/` |
 | `--time <ms>` / `--memory <MiB>` | 覆盖题目 `config.json` 的 `time` / `memory` |
 | `--lang auto\|cpp\|python` | 提交语言，默认按后缀判断 |
 | `--checker auto\|none\|<path>` | 输出比较器，默认 `auto` |

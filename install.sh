@@ -159,7 +159,8 @@ print("ready" if ready else why)
     fi
 
     if [ -z "$TESTDATA" ]; then
-        for candidate in "$PWD/testData" "$PWD/../testData"; do
+        # 包内自带示例题，所以正常情况下总能找到测试数据。
+        for candidate in "$PWD/testData" "$PWD/../testData" "$SRC/testData"; do
             if [ -d "$candidate" ]; then TESTDATA="$candidate"; break; fi
         done
     fi

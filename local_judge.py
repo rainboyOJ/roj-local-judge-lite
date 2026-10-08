@@ -5,8 +5,8 @@
     python3 local_judge.py --pid 1000 solution.cpp
     python3 local_judge.py --pid 1000 solution.py --testdata ../testData
 
-测试数据默认自动查找：包上级目录、当前目录、当前目录的上级，任一个
-`testData/` 存在就用它；也可以用 `--testdata` 直接指定。
+测试数据默认自动查找：先当前目录及其上级（你自己项目里的 testData/ 优先），
+再找包内自带的示例数据 testData/；也可以用 `--testdata` 直接指定。
 
 它把三件事串起来，让用户不用起 judge_server 就能自己验一份代码：
 
@@ -81,11 +81,19 @@ def load_cases(data_dir: Path) -> list[tuple[str, Path, Path]]:
 def resolve_testdata(explicit: Optional[Path]) -> tuple[Optional[Path], list[Path]]:
     """确定测试数据根目录，返回 (目录, 尝试过的路径)。
 
-    安装到 ~/.local/share/roj-local-judge-lite 后并没有 package/../testData，所以除了
-    仓库布局，还要在当前目录和其上级找，用户在自己的项目里直接运行就能命中。
+    顺序是「用户自己的优先，包内自带的兜底」：先当前目录及其上级，用户在自己项目里
+    运行时不会被动到包里的示例数据；再找包内 testData/，所以装到
+    ~/.local/share/roj-local-judge-lite 后在任意目录都能直接评测自带的示例题；
+    最后保留包上级目录，兼容包位于仓库子目录的老布局。
     """
     cwd = Path.cwd()
-    candidates = [explicit, PROJECT_ROOT / "testData", cwd / "testData", cwd.parent / "testData"]
+    candidates = [
+        explicit,
+        cwd / "testData",
+        cwd.parent / "testData",
+        PACKAGE_DIR / "testData",
+        PROJECT_ROOT / "testData",
+    ]
     tried: list[Path] = []
     for candidate in candidates:
         if candidate is None:
@@ -363,7 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lang", choices=("auto", "cpp", "python"), default="auto",
                         help="提交语言，默认按后缀判断")
     parser.add_argument("--testdata", type=Path, default=None,
-                        help="测试数据根目录；默认依次尝试 ../testData、./testData、./../testData")
+                        help="测试数据根目录；默认依次尝试 ./testData、./../testData、包内 testData/")
     parser.add_argument("--time", type=int, help="CPU 限制 ms，覆盖题目 config.json")
     parser.add_argument("--memory", type=int, help="内存限制 MiB，覆盖题目 config.json")
     parser.add_argument("--checker", default="auto",
