@@ -765,20 +765,6 @@ def classify_execution(report: ExecutionReport, memory: Optional[MemoryResult],
     return Verdict.OK, ""
 
 
-# ── 兼容层（下一步删除）：旧调用点仍写结果对象 ─────────────────────────────────
-def _set_verdict(result: CaseResult, limits: Limits) -> None:
-    """把 CaseResult 里的执行事实抽出来交给纯判定函数，写回结果对象。"""
-    report = ExecutionReport(
-        cpu_time_us=result.cpu_time_us, cpu_time_ms=result.cpu_time_ms,
-        real_time_ms=result.real_time_ms, rss_kb=result.rss_kb,
-        timed_out=result.timed_out, signal=result.signal, exit_code=result.exit_code,
-    )
-    memory = None
-    if result.memory_peak_bytes or result.oom_events or result.oom_kills:
-        memory = MemoryResult(result.memory_peak_bytes, result.oom_events, result.oom_kills)
-    result.verdict, result.message = classify_execution(report, memory, limits)
-
-
 # ── step 03 · 固定文件路径（第 04 章）────────────────────────────────────────
 def _check_stream_paths(*paths: Path) -> None:
     """防止 O_TRUNC 截断输入或让两个输出互相覆盖；也检查符号链接和硬链接。"""
@@ -978,6 +964,64 @@ def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
     return path, str(path)
 
 
+def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
+               limits: Limits, *, work_dir: Path, index: int, checker: Optional[Path],
+               cgroup_root: Path, isolated: bool) -> tuple[str, str, CaseResult]:
+    """一个测试点的事务：执行 → 资源收尾 → 判定 → 比较答案。
+
+    返回 (最终 verdict, detail, result)。最终 verdict 不暴露内部的 OK：
+    只有内部 OK 才比较答案，得到 AC/WA；SYSTEM_ERROR 映射为 SE。
+
+    资源生命周期完全在本函数内：run_case 内部用 `with MemoryCgroup(...)`
+    包住创建→执行→停止→读统计→删除（无 cgroup 时用空上下文），所以
+    这里看不到 cgroup 文件操作，只有一次调用。
+    """
+    user_output = work_dir / f"case-{index}.out"
+    stderr_path = work_dir / f"case-{index}.err"
+    # CLI 只选择能力，不实现第二套执行器。没有 cgroup 时仍由 executor
+    # 设置限额、降权并回收进程组；区别是没有内存计量和 MLE 判定。
+    result = run_case(
+        run_argv, input_path, user_output, limits,
+        stderr_path=stderr_path, cwd=work_dir,
+        cgroup_root=cgroup_root, use_cgroup=isolated,
+    )
+    verdict = result.verdict.value
+    if verdict == "OK":
+        verdict = "AC" if compare_output(input_path, expected_path,
+                                         user_output, checker) else "WA"
+    elif verdict == "SYSTEM_ERROR":
+        verdict = "SE"
+    detail = result.message if verdict == "SE" else describe(result, verdict, expected_path, user_output)
+    return verdict, detail, result
+
+
+def judge_submission(run_argv: list[str], cases: list[tuple[str, Path, Path]],
+                     limits: Limits, *, work_dir: Path, checker: Optional[Path],
+                     cgroup_root: Path, isolated: bool) -> int:
+    """编译好之后的完整评测：逐点调用 judge_case，展示并汇总。
+
+    只负责流程与汇总；单个测试点的资源生命周期在 judge_case 里。
+    返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1。
+    """
+    started = time.monotonic()
+    verdicts: list[str] = []
+    for index, (name, input_path, expected_path) in enumerate(cases, start=1):
+        verdict, detail, result = judge_case(
+            run_argv, input_path, expected_path, limits, work_dir=work_dir,
+            index=index, checker=checker, cgroup_root=cgroup_root, isolated=isolated,
+        )
+        verdicts.append(verdict)
+        print(format_case_line(index, name, verdict, result, detail))
+
+    elapsed = time.monotonic() - started
+    passed = verdicts.count("AC")
+    # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
+    overall = next((v for v in verdicts if v != "AC"), "AC")
+    print()
+    print(f"结果：{overall}  通过 {passed}/{len(cases)}  用时 {elapsed:.2f}s")
+    return 0 if overall == "AC" else 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     # ── step 01 · 运行 CLI：把一份提交交给本地评测 ────────────────────────
     #    文章「第一步」那条命令背后执行的，就是这个函数。
@@ -1087,44 +1131,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("编译通过")
 
         # ── step 05 · 逐测试点执行，只对 OK 的运行比较答案 ────────────────
-        started = time.monotonic()
-        verdicts: list[str] = []
-        for index, (name, input_path, expected_path) in enumerate(cases, start=1):
-            user_output = work_dir / f"case-{index}.out"
-            stderr_path = work_dir / f"case-{index}.err"
-            # CLI 只选择能力，不实现第二套执行器。没有 cgroup 时仍由 helper
-            # 设置限额、降权并回收进程组；区别是没有内存计量和 MLE 判定。
-            result = run_case(
-                run_argv, input_path, user_output, limits,
-                stderr_path=stderr_path, cwd=work_dir,
-                cgroup_root=cgroup_root, use_cgroup=isolated,
-            )
-
-            verdict = result.verdict.value
-            if verdict == "OK":
-                verdict = "AC" if compare_output(input_path, expected_path,
-                                                 user_output, checker) else "WA"
-            elif verdict == "SYSTEM_ERROR":
-                verdict = "SE"
-            verdicts.append(verdict)
-            detail = describe(result, verdict, expected_path, user_output)
-            if verdict == "SE":
-                detail = result.message
-            print(format_case_line(index, name, verdict, result, detail))
-
-        # ── step 07 · 汇总结果、返回退出码 ────────────────────────────────
-        elapsed = time.monotonic() - started
-        passed = verdicts.count("AC")
-        # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
-        overall = next((v for v in verdicts if v != "AC"), "AC")
-        print()
-        print(f"结果：{overall}  通过 {passed}/{len(cases)}  用时 {elapsed:.2f}s")
+        exit_code = judge_submission(
+            run_argv, cases, limits, work_dir=work_dir, checker=checker,
+            cgroup_root=cgroup_root, isolated=isolated,
+        )
         if args.keep_work_dir:
             print(f"工作目录：{work_dir}")
-        return 0 if overall == "AC" else 1
+        return exit_code
     finally:
         # step 07 的另一半：清理临时工作目录。
-        # 它与 run_case() 的进程/cgroup 清理各管一类资源。
+        # 它与 judge_case 里 run_case 的进程/cgroup 清理各管一类资源。
         if not args.keep_work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 

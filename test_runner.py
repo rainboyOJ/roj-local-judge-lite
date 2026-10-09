@@ -16,8 +16,8 @@ from unittest.mock import patch
 
 import judge
 from judge import (CaseResult, ExecutionReport, ExecutorError, Limits, MemoryResult,
-                   ProtectionLimits, Verdict, _set_verdict, classify_execution,
-                   invoke_executor, make_protection_limits, run_case)
+                   ProtectionLimits, Verdict, classify_execution, invoke_executor,
+                   judge_case, make_protection_limits, run_case)
 
 
 class ExecutionTestsMixin:
