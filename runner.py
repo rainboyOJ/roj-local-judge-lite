@@ -14,6 +14,22 @@ helper 管 fork/exec、限额、wait4 和进程组清理。use_cgroup=False 只�
 cgroup 能力，不切换执行实现；这时没有内存计量，也不能判定 MLE。
 
 不编译、不比对答案；OK 只表示正常执行。依赖 Linux、Python 3.8+、预构建 helper。
+
+执行顺序
+--------
+一次 run_case() 调用按下面的顺序发生。**代码按职责分段、不按步号排列**，所以文件里
+step 编号会跳。每一步后面是讲解它的教程章节。
+
+    step 01  限制口径       Limits / memory_max_bytes      第 06 章「第三步」
+    step 02  校验配置       Limits.validate                第 09 章「第一步」
+    step 03  固定路径       _check_stream_paths            第 04 章
+    step 04  工作目录身份   run_case                       第 02、07 章
+    step 05  准备 cgroup    MemoryCgroup / nullcontext     第 08 章
+    step 06  启动 helper    helper_args / _invoke_helper   第 09 章「第四步」
+    step 07  收尾 cgroup    group.stop / memory_result     第 08 章
+    step 08  判定           _set_verdict / Verdict         第 09 章「第五步」
+    step 09  报告结果       CaseResult / to_dict           第 05 章「第四步」
+    step 10  CLI 入口       main                           第 09 章
 """
 
 from __future__ import annotations
@@ -35,6 +51,7 @@ from memory_cgroup import MemoryCgroup
 __all__ = ["Limits", "Verdict", "CaseResult", "run_case"]
 
 
+# ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────────────
 class Verdict(str, enum.Enum):
     OK = "OK"
     TLE = "TLE"
@@ -43,6 +60,7 @@ class Verdict(str, enum.Enum):
     SYSTEM_ERROR = "SYSTEM_ERROR"
 
 
+# ── step 01 · 限制口径：判定线与保护上限（第 06 章「第三步」）────────────────
 @dataclasses.dataclass
 class Limits:
     """单次执行的限制；时间单位 ms，memory_kb 单位 KiB，其余内存单位 MiB。"""
@@ -62,22 +80,26 @@ class Limits:
     # wall 是独立的防卡死上限，包含 I/O、调度和等待时间。
     # nproc 限制同一真实 UID 的总进程/线程数，默认关闭。
 
+    # step 01：保护上限 = 判定线 + 余量，故意比判定线宽。
     def memory_max_bytes(self) -> int:
         if self.memory_kb == 0:
             return 0
         return (self.memory_kb + self.memory_slack_kb) * 1024
 
+    # step 01：wall 是独立的防卡死上限，包含 I/O 与等待时间。
     def resolved_wall_ms(self) -> int:
         if self.wall_time_ms > 0:
             return self.wall_time_ms
         return self.time_ms + self.wall_slack_ms if self.time_ms > 0 else 0
 
+    # ── step 02 · 校验配置 ────────────────────────────────────────────────────
     def validate(self) -> None:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{field.name} 必须是非负整数")
 
+    # ── step 06 · 转成 helper 的参数数组 ──────────────────────────────────────
     def helper_args(self, cgroup_procs: Optional[Path] = None) -> list[str]:
         """转换为 helper 的内部参数；顺序对应 C 中的 parse_options。
 
@@ -98,6 +120,7 @@ class Limits:
         return args
 
 
+# ── step 09 · 报告结果（第 05 章「第四步」）──────────────────────────────────
 @dataclasses.dataclass
 class CaseResult:
     verdict: Verdict = Verdict.SYSTEM_ERROR
@@ -121,12 +144,14 @@ class CaseResult:
     output_path: str = ""
     stderr_path: str = ""
 
+    # step 09：给 CLI 的 JSON 输出。
     def to_dict(self) -> Dict[str, object]:
         result = dataclasses.asdict(self)
         result["verdict"] = self.verdict.value
         return result
 
 
+# ── step 06 · 给被测进程准备环境（第 09 章）─────────────────────────────────
 def _child_env(work_dir: Path, inherit: bool) -> Dict[str, str]:
     env = dict(os.environ) if inherit else {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -140,6 +165,7 @@ def _child_env(work_dir: Path, inherit: bool) -> Dict[str, str]:
     return env
 
 
+# ── step 06 · 启动 helper 并收回资源报告（第 09 章「第四步」）────────────────
 def _invoke_helper(command: list[str], env: Dict[str, str]) -> CaseResult:
     """启动独立监控进程，并把它的资源报告转换成 Python 结果。
 
@@ -173,6 +199,7 @@ def _invoke_helper(command: list[str], env: Dict[str, str]) -> CaseResult:
         raise RuntimeError(f"helper 返回了无效的资源报告: {exc}") from exc
 
 
+# ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────────────
 def _set_verdict(result: CaseResult, limits: Limits) -> None:
     """仅根据可验证的资源数据和退出状态分类，不读取或猜测 stderr 内容。"""
     if result.oom_events or result.oom_kills:
@@ -193,6 +220,7 @@ def _set_verdict(result: CaseResult, limits: Limits) -> None:
     # CPU 判断使用原始微秒数，cpu_time_ms 的四舍五入仅供展示。
 
 
+# ── step 03 · 固定文件路径（第 04 章）────────────────────────────────────────
 def _check_stream_paths(*paths: Path) -> None:
     """防止 O_TRUNC 截断输入或让两个输出互相覆盖；也检查符号链接和硬链接。"""
     for i, path in enumerate(paths):
@@ -203,6 +231,7 @@ def _check_stream_paths(*paths: Path) -> None:
                 raise ValueError("stdin、stdout、stderr 必须使用不同的文件")
 
 
+# ── step 02 → step 09 · 一次完整的运行（第 09 章「第三步」把这里分成五段）──────
 def run_case(
     argv: list[str],
     input_path: Path,
@@ -231,6 +260,7 @@ def run_case(
     只供诊断；此模式只能清理同一进程组，无法覆盖主动 setsid 的后代。
     配置错误抛 ValueError，启动/重定向/helper 故障返回 SYSTEM_ERROR。
     """
+    # ── step 02 · 校验配置（第 09 章「第一步」）───────────────────────────────
     if not argv:
         raise ValueError("argv 不能为空")
     limits = limits or Limits()
@@ -239,16 +269,19 @@ def run_case(
         if type(value) is not int or not 0 <= value < 2**32 - 1:
             raise ValueError(f"{name} 必须是有效的非负 UID/GID")
 
+    # ── step 03 · 固定文件路径（第 04 章）────────────────────────────────────
     # 先固定文件路径：helper 改变 cwd 之后，重定向仍要指向调用者指定的文件。
     input_path = Path(input_path).absolute()
     output_path = Path(output_path).absolute()
     stderr_path = Path(stderr_path or str(output_path) + ".err").absolute()
     _check_stream_paths(input_path, output_path, stderr_path)
+    # ── step 04 · 决定工作目录与执行身份（第 02、07 章）───────────────────────
     work_dir = Path(cwd or Path.cwd()).absolute()
     helper = Path(helper_path or Path(__file__).with_name("runner_helper")).absolute()
     if drop_privileges is None:
         drop_privileges = os.geteuid() == 0
 
+    # ── step 05 · 准备 cgroup 生命周期（第 08 章）────────────────────────────
     root = Path(cgroup_root or os.environ.get("ROJ_JUDGE_CGROUP_ROOT", "/sys/fs/cgroup/roj-judge")).absolute()
     try:
         if not helper.is_file() or not os.access(helper, os.X_OK):
@@ -257,6 +290,7 @@ def run_case(
         # 模式只决定是否包一层 cgroup 生命周期，下面的执行代码始终只有一份。
         context = MemoryCgroup(root, limits.memory_max_bytes()) if use_cgroup else nullcontext()
         with context as group:
+            # ── step 06 · 拼参数、备环境、启动 helper（第 09 章「第四步」）────────
             command = [
                 str(helper), *limits.helper_args(group.procs_path if group is not None else None),
                 str(int(drop_privileges)), str(run_uid), str(run_gid),
@@ -264,21 +298,25 @@ def run_case(
             ]
             result = _invoke_helper(command, _child_env(work_dir, inherit_env))
             if group is not None:
+                # ── step 07 · 收尾 cgroup 并补内存统计（第 08 章）────────────────
                 # 直接子进程退出不代表所有后代都退出。先停止整个组，再读取最终
                 # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
                 group.stop()
                 result = dataclasses.replace(result, **group.memory_result())
+        # ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────
         # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
         # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
         _set_verdict(result, limits)
     except (OSError, RuntimeError) as exc:
         result = CaseResult(message=str(exc))
 
+    # ── step 09 · 报告结果（第 05 章「第四步」）──────────────────────────────
     result.output_path = str(output_path)
     result.stderr_path = str(stderr_path)
     return result
 
 
+# ── step 10 · CLI 入口（第 09 章）────────────────────────────────────────────
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="单程序资源限制与统计，不编译、不比较答案")
     parser.add_argument("--input", type=Path, default=Path("/dev/null"))
@@ -304,6 +342,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--helper", type=Path, help="预先构建的 runner_helper 路径")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- 后接可执行文件及其参数")
     args = parser.parse_args(argv)
+    # step 10 · CLI 把参数翻译成一次 run_case 调用。
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("请在 -- 后指定可执行文件及其参数")

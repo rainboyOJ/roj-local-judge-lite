@@ -9,6 +9,22 @@
  * fork 后父子从同一位置继续，但拥有各自的地址空间；子进程的 chdir、限额、
  * 降权不会改变 helper。exec 则用用户程序替换子进程，不会创建新的 PID。
  * cgroup 是可选能力：不入组时仍走相同的启动、限额、监控与回收流程。
+ *
+ * 执行顺序
+ * --------
+ * 一次 helper 运行按下面的顺序发生。代码按职责分段、不按步号排列，所以文件里
+ * step 编号会跳。每一步后面是讲解它的教程章节。
+ *
+ *   step 01  解析参数            parse_options            第 03 章
+ *   step 02  信号、管道、fork     main 前半                第 03 章「第一步」
+ *   step 03  入组、独立进程组     run_child 开头           第 07 章「第二步」
+ *   step 04  重定向标准流         redirect_stream          第 04 章
+ *   step 05  设置资源限额         apply_limit              第 06 章「第二步」
+ *   step 06  降权                run_child                第 07 章「第五步」
+ *   step 07  PDEATHSIG 与 exec   run_child 结尾           第 03 章「第二步」
+ *   step 08  等待与看门狗         monitor_child            第 06 章「第四步」
+ *   step 09  确认 setup 结果      check_setup              第 05 章「第三步」
+ *   step 10  输出资源报告         print_result             第 05 章「第四步」
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -25,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/* ── step 01 · 解析参数（第 03 章）───────────────────────────────────── */
 struct Options {
   rlim_t cpu_seconds, stack_bytes, output_bytes, nproc;
   long long wall_ms;
@@ -35,6 +52,7 @@ struct Options {
   char **command;
 };
 
+/* ── step 08 · 等待与看门狗（第 06 章「第四步」）─────────────────────── */
 struct Result {
   int status;
   int timed_out;
@@ -44,28 +62,33 @@ struct Result {
 
 /* 私有管道区分 setup 失败与用户程序 exit(126/127)。操作名直接传递，
  * Python 不需要维护另一份错误编号表。这里只传本文件中的固定操作名。 */
+/* ── step 09 · 确认 setup 结果（第 05 章「第三步」）───────────────────── */
 struct SetupError {
   char operation[32];
   int number;
 };
 
+/* ── step 02 · 信号、私有管道、fork（第 03 章「第一步」）──────────────── */
 static volatile sig_atomic_t interrupted = 0;
 
 static void on_signal(int signo) {
   interrupted = signo;
 }
 
+/* step 02：helper 自己的启动失败（不是被测程序的失败）。 */
 static void fail(const char *operation) {
   perror(operation);
   exit(125);
 }
 
+/* step 08：wall 看门狗用的单调时钟。 */
 static long long monotonic_ms(void) {
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) fail("clock_gettime");
   return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+/* step 01：只接受十进制非负整数，拒绝 '-'、空串和尾随垃圾。 */
 static unsigned long long parse_number(const char *text) {
   char *end;
   errno = 0;
@@ -109,6 +132,7 @@ static struct Options parse_options(int argc, char **argv) {
   };
 }
 
+/* step 09：把「哪一步失败了」写进私有管道，而不是只留一个退出码。 */
 static void setup_failed(int fd, const char *operation) {
   struct SetupError error = {.number = errno};
   snprintf(error.operation, sizeof(error.operation), "%s", operation);
@@ -120,6 +144,7 @@ static void setup_failed(int fd, const char *operation) {
   _exit(126);
 }
 
+/* ── step 05 · 设置资源限额（第 06 章「第二步」「第五步」）────────────── */
 static void apply_limit(int fd, const char *name, int resource, rlim_t amount) {
   /* 0 保持继承值，CORE 例外。CPU 的 hard 多留一秒，先让 soft 发 SIGXCPU。 */
   if (amount == 0 && resource != RLIMIT_CORE) return;
@@ -128,13 +153,16 @@ static void apply_limit(int fd, const char *name, int resource, rlim_t amount) {
   if (setrlimit(resource, &value) < 0) setup_failed(fd, name);
 }
 
+/* ── step 04 · 重定向标准流（第 04 章）───────────────────────────────── */
 static void redirect_stream(int error_fd, const char *name, const char *path, int target, int flags) {
   int fd = open(path, flags, 0600);
   if (fd < 0 || dup2(fd, target) < 0) setup_failed(error_fd, name);
   if (fd != target) close(fd);
 }
 
+/* ── step 03 → step 07 · 子进程：入组、重定向、限额、降权、exec ───────── */
 static void run_child(const struct Options *options, int error_fd, pid_t helper_pid) {
+  /* ── step 03 · 入组、独立进程组（第 07 章「第二步」、第 08 章）────────── */
   /* 1. 独立进程组让超时/取消可以一次清理同组后代。恢复 helper 改过的信号。 */
   struct sigaction action = {.sa_handler = SIG_DFL};
   sigemptyset(&action.sa_mask);
@@ -153,23 +181,27 @@ static void run_child(const struct Options *options, int error_fd, pid_t helper_
   }
   if (chdir(options->cwd) < 0) setup_failed(error_fd, "chdir");
 
+  /* ── step 04 · 重定向标准流（第 04 章）─────────────────────────────── */
   /* 2. 先打开文件，之后再降权。helper 的 stdout 留作报告，不传给用户程序。 */
   redirect_stream(error_fd, "redirect stdin", options->input, 0, O_RDONLY);
   redirect_stream(error_fd, "redirect stdout", options->output, 1, O_WRONLY | O_CREAT | O_TRUNC);
   redirect_stream(error_fd, "redirect stderr", options->error, 2, O_WRONLY | O_CREAT | O_TRUNC);
 
+  /* ── step 05 · 设置资源限额（第 06 章「第二步」「第五步」）──────────── */
   /* 3. 设置限制，然后降权。 */
   apply_limit(error_fd, "RLIMIT_STACK", RLIMIT_STACK, options->stack_bytes);
   apply_limit(error_fd, "RLIMIT_FSIZE", RLIMIT_FSIZE, options->output_bytes);
   apply_limit(error_fd, "RLIMIT_CPU", RLIMIT_CPU, options->cpu_seconds);
   apply_limit(error_fd, "RLIMIT_NPROC", RLIMIT_NPROC, options->nproc);
   apply_limit(error_fd, "RLIMIT_CORE", RLIMIT_CORE, 0);
+  /* ── step 06 · 降权（第 07 章「第五步」）───────────────────────────── */
   if (options->drop_privileges) {
     if (setgroups(0, NULL) < 0) setup_failed(error_fd, "setgroups");
     if (setgid(options->gid) < 0) setup_failed(error_fd, "setgid");
     if (setuid(options->uid) < 0) setup_failed(error_fd, "setuid");
   }
 
+  /* ── step 07 · PDEATHSIG 与 exec（第 03 章「第二步」）──────────────── */
   /* 4. helper 意外死亡时杀掉直接子进程。setuid 会清除这个设置，必须放在其后。
    * 正常取消则由 helper 杀整个组。主动 setsid 逃离进程组需要 cgroup 另行管控。 */
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) setup_failed(error_fd, "PR_SET_PDEATHSIG");
@@ -179,11 +211,13 @@ static void run_child(const struct Options *options, int error_fd, pid_t helper_
   setup_failed(error_fd, "exec");
 }
 
+/* step 08：超时或取消时回收被测进程组。 */
 static void kill_submission(pid_t child) {
   kill(-child, SIGKILL);
   kill(child, SIGKILL); /* 同时覆盖子进程尚未建好进程组的情况。 */
 }
 
+/* step 08：非阻塞 wait4 轮询 + wall 截止时间，见函数内注释。 */
 static struct Result monitor_child(pid_t child, long long start, long long wall_ms) {
   /* wait4 同时返回“如何退出”和“消耗多少资源”。先非阻塞轮询，才能在
    * 子进程还活着时检查 wall 截止时间；发出 SIGKILL 后再阻塞回收，避免僵尸。
@@ -215,6 +249,7 @@ static struct Result monitor_child(pid_t child, long long start, long long wall_
   return result;
 }
 
+/* step 09：管道里的错误记录才是 setup 失败的证据，EOF 不是。 */
 static void check_setup(int error_fd) {
   /* exit(126/127) 也可能来自用户程序，不能仅凭退出码认定启动失败。
    * 子进程 setup 失败会写入操作名与 errno；exec 成功会由 CLOEXEC 关闭写端。
@@ -234,6 +269,7 @@ static void check_setup(int error_fd) {
   exit(125);
 }
 
+/* step 10：helper 的 stdout 就是资源报告，与用户程序的输出分开。 */
 static void print_result(const struct Result *result) {
   long long cpu_us = ((long long)result->usage.ru_utime.tv_sec + result->usage.ru_stime.tv_sec)
                     * 1000000 + result->usage.ru_utime.tv_usec + result->usage.ru_stime.tv_usec;
@@ -244,8 +280,11 @@ static void print_result(const struct Result *result) {
          WIFEXITED(result->status) ? WEXITSTATUS(result->status) : 0);
 }
 
+/* ── step 01、02、08、09、10 · helper 主流程 ─────────────────────────── */
 int main(int argc, char **argv) {
+  /* ── step 01 · 解析参数 ────────────────────────────────────────────── */
   struct Options options = parse_options(argc, argv);
+  /* ── step 02 · 装信号处理、建私有管道、fork ────────────────────────── */
   struct sigaction action = {.sa_handler = on_signal};
   sigemptyset(&action.sa_mask);
   if (sigaction(SIGTERM, &action, NULL) < 0 ||
@@ -272,9 +311,12 @@ int main(int argc, char **argv) {
     errno = saved_errno;
     fail("setpgid");
   }
+  /* ── step 08 · 等待与看门狗 ────────────────────────────────────────── */
   struct Result result = monitor_child(child, start, options.wall_ms);
+  /* ── step 09 · 确认 setup 是否失败 ─────────────────────────────────── */
   check_setup(error_pipe[0]);
   if (interrupted) return 128 + interrupted;
+  /* ── step 10 · 输出资源报告 ────────────────────────────────────────── */
   print_result(&result);
   return 0;
 }
