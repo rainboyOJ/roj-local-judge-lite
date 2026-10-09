@@ -261,16 +261,34 @@ def check_cgroup_root(root: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _delegate_mode_args() -> list[str]:
+    """root 没有自己的用户管理器，自动委派改用系统管理器。
+
+    `sudo python3 local_judge.py ...` 时 sudo 会重置环境（XDG_RUNTIME_DIR 消失），
+    普通用户那条路走不通；而 systemd-run 的系统管理器本来就需要 root，正好对上。
+    """
+    return [] if os.geteuid() == 0 else ["--user"]
+
+
+def delegation_blocker() -> str:
+    """返回阻碍自动委派的原因；空串表示可以尝试。"""
+    if not shutil.which("systemd-run"):
+        return "未找到 systemd-run"
+    # 用户管理器靠 XDG_RUNTIME_DIR 找到 socket；系统管理器不需要。
+    if _delegate_mode_args() and not os.environ.get("XDG_RUNTIME_DIR"):
+        return "缺少 XDG_RUNTIME_DIR"
+    return ""
+
+
 def try_auto_delegate() -> tuple[bool, str]:
     """探测能否用 systemd-run 起一个委派 scope；成功则重新执行自己。
 
-    这样普通用户不必手工拼 `systemd-run --user --scope -p Delegate=yes`，
-    也避免在容器等没有 user manager 的环境里报错退出。
+    这样不必手工拼 `systemd-run [--user] --scope -p Delegate=yes`，
+    也避免在容器等没有用户管理器的环境里报错退出。
     """
-    if not shutil.which("systemd-run"):
-        return False, "未找到 systemd-run"
-    if not os.environ.get("XDG_RUNTIME_DIR"):
-        return False, "缺少 XDG_RUNTIME_DIR"
+    blocker = delegation_blocker()
+    if blocker:
+        return False, blocker
     probe = [*_delegated_prefix(), sys.executable, "-c", "print('local-judge-delegated-ok')"]
     try:
         proc = subprocess.run(probe, capture_output=True, text=True, timeout=60)
@@ -288,7 +306,8 @@ def _delegated_prefix() -> list[str]:
     --quiet 去掉 systemd-run 自己的 “Running as unit” 提示，但保留被测命令的
     stdout/stderr；--scope 让命令同步执行并原样传回退出码。
     """
-    return ["systemd-run", "--user", "--quiet", "--scope", "-p", "Delegate=yes", "--",
+    return ["systemd-run", *_delegate_mode_args(), "--quiet", "--scope",
+            "-p", "Delegate=yes", "--",
             sys.executable, str(PACKAGE_DIR / "examples" / "delegated.py")]
 
 
@@ -474,6 +493,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"执行 cgroup 隔离，root={cgroup_root}")
     else:
         print(f"执行降级模式：{reason}")
+        if os.geteuid() == 0:
+            print("  root 想启用隔离：先准备一个委派父目录（详见 README「构建与权限」），例如")
+            print(f"    mkdir -p {DEFAULT_CGROUP_ROOT} && "
+                  f"echo +memory > {DEFAULT_CGROUP_ROOT}/cgroup.subtree_control")
         print("  ⚠ 无内存隔离，MLE 无法判定；TLE 依赖 wall 与 RLIMIT_CPU（整秒）")
     print(f"比较 {checker_note}")
     print()

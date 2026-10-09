@@ -2,6 +2,7 @@
 """在 systemd 委派的专用 scope 内准备测试/执行环境。
 
 systemd-run --user --scope -p Delegate=yes -- python3 examples/delegated.py make check
+systemd-run --scope -p Delegate=yes -- python3 examples/delegated.py make check   # root
 systemd-run --user --scope -p Delegate=yes -- python3 examples/delegated.py python3 runner.py ...
 
 只在这个新建的 scope 内使用。不要在普通登录 session 或其他服务里运行本脚本。
@@ -15,7 +16,7 @@ scope = next(line.split("::", 1)[1].strip() for line in
              Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
 root = Path("/sys/fs/cgroup") / scope.lstrip("/")
 if not root.name.endswith(".scope") or not os.access(root, os.W_OK):
-    sys.exit("请通过 systemd-run --user --scope -p Delegate=yes 启动本脚本")
+    sys.exit("请通过 systemd-run [--user] --scope -p Delegate=yes 启动本脚本")
 if set((root / "cgroup.procs").read_text().split()) != {str(os.getpid())}:
     sys.exit("只允许准备本脚本独占的新 scope，不能修改包含其他进程的 scope")
 if "memory" not in (root / "cgroup.controllers").read_text().split():

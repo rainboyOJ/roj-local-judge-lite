@@ -15,6 +15,7 @@ AC / WA / TLE / MLE / RE 结论。
 - [快速使用](#快速使用)
   - [当作执行器或库](#当作执行器或库)
 - [构建与权限](#构建与权限)
+  - [没有现成委派目录时](#没有现成委派目录时)
 - [在 macOS 上运行](#在-macos-上运行)
 - [在 Windows 上运行](#在-windows-上运行)
 - [Python 接口](#python-接口)
@@ -158,6 +159,43 @@ python3 runner.py --cgroup-root /sys/fs/cgroup/your-delegated-parent \
 
 也可设置环境变量 `ROJ_JUDGE_CGROUP_ROOT`。未指定时使用 `/sys/fs/cgroup/roj-judge`；
 这个默认路径也必须由部署环境预先准备，runner 不会自行配置系统目录。
+
+### 没有现成委派目录时
+
+三种拿到内存隔离的方式，按省事程度排列：
+
+**1. 普通用户：什么都不用做。** 工具会自动 `systemd-run --user --scope -p Delegate=yes`
+起一个临时委派 scope 后重跑自己（需要 `systemd-run` 和 `XDG_RUNTIME_DIR`）：
+
+```bash
+python3 local_judge.py --pid 1000 solution.cpp
+# 执行 cgroup 隔离，root=/sys/fs/cgroup/user.slice/.../run-XXXX.scope
+```
+
+**2. root：也不用准备目录。** root 没有自己的用户管理器，工具会用系统管理器委派：
+
+```bash
+sudo python3 local_judge.py --pid 1000 solution.cpp
+```
+
+不要因为想拿到隔离而手动保留 `XDG_RUNTIME_DIR` 去跑 `systemd-run --user`：`sudo`
+默认重置环境，且 root 的 `--user` 管理器通常不存在。委派是 systemd 把一棵子树的
+属主交给某个用户/服务，不是 root 权限的产物。
+
+**3. 想要固定的父目录（生产部署、无 systemd、容器）：** 自己准备一次。
+`roj-judge` 不会自动创建，因为那属于改动系统级目录：
+
+```bash
+sudo mkdir -p /sys/fs/cgroup/roj-judge
+echo +memory | sudo tee /sys/fs/cgroup/roj-judge/cgroup.subtree_control
+sudo chown "$USER" /sys/fs/cgroup/roj-judge   # 让普通用户也能建子组
+```
+
+`cgroup.subtree_control` 里的 `+memory` 是必需的：子组要能计量内存，父目录必须先
+为子组启用 memory controller。目录刚建好、里面没有进程，所以这里不受 cgroup v2
+“管理目录自身不能有进程”的限制。之后 `ROJ_JUDGE_CGROUP_ROOT=/sys/fs/cgroup/roj-judge`
+或默认路径都能直接用。`docker/cgroup-init.sh` 在容器里做的就是同一件事（额外还要把
+root 里的进程迁走，因为容器里 `/sys/fs/cgroup` 自己也是管理目录）。
 
 ## 在 macOS 上运行
 

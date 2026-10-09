@@ -494,5 +494,37 @@ class BundledTestDataTests(unittest.TestCase):
             self.assertEqual(root, directory / "testData")
 
 
+class DelegationModeTests(unittest.TestCase):
+    """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
+
+    def test_user_gets_user_manager(self):
+        with patch.object(local_judge.os, "geteuid", return_value=1000):
+            self.assertEqual(local_judge._delegate_mode_args(), ["--user"])
+            prefix = local_judge._delegated_prefix()
+        self.assertEqual(prefix[:4], ["systemd-run", "--user", "--quiet", "--scope"])
+        self.assertIn("delegated.py", prefix[-1])
+
+    def test_root_uses_system_manager(self):
+        # sudo 会清掉 XDG_RUNTIME_DIR，root 又没有用户管理器，所以必须换成系统管理器。
+        with patch.object(local_judge.os, "geteuid", return_value=0):
+            self.assertEqual(local_judge._delegate_mode_args(), [])
+            prefix = local_judge._delegated_prefix()
+        self.assertEqual(prefix[:3], ["systemd-run", "--quiet", "--scope"])
+        self.assertNotIn("--user", prefix)
+
+    def test_blocker_ignores_missing_runtime_dir_for_root(self):
+        with patch.object(local_judge.shutil, "which", return_value="/usr/bin/systemd-run"):
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(local_judge.os, "geteuid", return_value=1000):
+                self.assertEqual(local_judge.delegation_blocker(), "缺少 XDG_RUNTIME_DIR")
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(local_judge.os, "geteuid", return_value=0):
+                self.assertEqual(local_judge.delegation_blocker(), "")
+
+    def test_blocker_without_systemd_run(self):
+        with patch.object(local_judge.shutil, "which", return_value=None):
+            self.assertEqual(local_judge.delegation_blocker(), "未找到 systemd-run")
+
+
 if __name__ == "__main__":
     unittest.main()
