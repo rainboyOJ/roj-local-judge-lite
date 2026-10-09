@@ -749,6 +749,60 @@ trap cleanup EXIT
 
 和第二层的 `if / elif / else` 是同一个逻辑，只是排版成了表格，并把上限、峰值、退出码都列出来，方便对照。
 
+## 补一个容易忽略的点：判定线和保护上限可以是两个值
+
+前面所有实验里，`memory.max` **既是判定线又是硬上限** —— 同一个数字。所以你只见到两种结局：没碰到上限就是 OK，碰到了就被杀掉、判 MLE。
+
+但真实评测机把这两件事**拆成两个值**，因为它们目的不同：
+
+| | 作用 | 设成多少 |
+|---|---|---|
+| 判定线 | 超过就判 MLE，这是**评分标准** | 题目给的 128MB |
+| 保护上限 `memory.max` | 超过就杀掉，这是**保护机器的保险** | 判定线 + 一点余量 |
+
+**为什么要留余量**：让「只超一点点」的程序能**跑完**，从而拿到精确的峰值数字来判定；只有「超得太狠」才会被硬杀掉。
+
+仓库里的 [cgroup_demo.py](examples/cgroup_demo.py) 就是演示这个的（它是第 8 章的实验）。它把判定线设成 8MiB、余量 16MiB，于是 `memory.max = 24MiB`：
+
+```bash
+make -C docs/tutorial/examples      # 它要调用 .build/allocate
+systemd-run --user --quiet --scope -p Delegate=yes -- \
+  python3 examples/delegated.py python3 docs/tutorial/examples/cgroup_demo.py
+```
+
+```text
+requested=4MiB   verdict=OK   peak=4.8MiB   exit=0 signal=0 oom=0 oom_kills=0
+requested=12MiB  verdict=MLE  peak=12.5MiB  exit=0 signal=0 oom=0 oom_kills=0
+requested=64MiB  verdict=MLE  peak=24.0MiB  exit=0 signal=9 oom=1 oom_kills=2
+```
+
+**重点看第二行**：判定是 MLE，但 `exit=0`、`signal=0`、`oom=0` —— **程序正常跑完了，一个 OOM 事件都没有**。
+
+因为它的峰值 12.5MiB：
+
+- 越过了 **8MiB 判定线** → 所以判 MLE
+- 没碰到 **24MiB 硬上限** → 所以没被杀
+
+这正是「两个阈值」才会产生的现象。
+
+### 这解释了我们判定逻辑里的一个疑问
+
+回头看前面那段判定：
+
+```bash
+if [[ $kills -gt 0 ]]; then          echo "MLE（有 OOM 事件）"
+elif [[ $peak -gt 268435456 ]]; then echo "MLE（峰值超限）"   # ← 本文的实验走不到这里
+else echo "OK"; fi
+```
+
+在**本文的 demo 里，第二个分支永远走不到**：因为 `memory.max` 就等于判定线，峰值一旦超过它，内核早就把程序杀了，第一个分支必然先命中。
+
+只有把两个阈值拆开（像 `cgroup_demo.py` 那样），第二个分支才真正有用武之地 —— 它处理的就是上面 12MiB 那种「跑完了但超线」的情况。
+
+**那顺序为什么是 OOM 优先？** 因为被 OOM 杀掉时，峰值会**停在上限附近**（第三行的 24.0MiB 就是 `memory.max` 本身），这个数字已经不代表程序真实想要多少内存了。这时 OOM 事件才是更准确的结论。
+
+> 想看得更细：[第 8 章](08-cgroup-memory.md) 第三步讲的就是这个实验；[memory_cgroup.py](../../memory_cgroup.py) 里的 `memory_max_bytes()` 是「判定线 + 余量」的算法；[runner.py](../../runner.py) 里的 `_set_verdict` 是那段三支判定的真实实现。
+
 ## 第三层小结
 
 | 第二层的问题 | 第三层的解法 |
