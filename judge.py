@@ -500,19 +500,13 @@ class Limits:
     def helper_args(self, cgroup_procs: Optional[Path] = None) -> list[str]:
         """转换为 executor 的内部参数；顺序对应 C 中的 parse_options。
 
-        CPU 向上取整成秒，栈与输出限额换成字节。cgroup 参数为空字符串时
-        表示显式关闭入组；Popen 直接传递参数数组，因此空参数不会被吞掉。
+        保护值的计算集中在 make_protection_limits()；本方法只负责把结果
+        排成 C 期望的顺序。cgroup 参数为空字符串时表示显式关闭入组；
+        Popen 直接传递参数数组，因此空参数不会被吞掉。
         """
-        values = [
-            (self.time_ms + self.cpu_slack_ms + 999) // 1000 if self.time_ms else 0,
-            self.stack_mb * 1024 * 1024,
-            self.output_limit_mb * 1024 * 1024,
-            self.nproc,
-            self.resolved_wall_ms(),
-        ]
-        if any(value >= 2**63 - 1 for value in values) or self.memory_max_bytes() >= 2**63 - 1:
-            raise ValueError("资源限制超出 executor 支持的整数范围")
-        args = [str(value) for value in values]
+        p = make_protection_limits(self)
+        args = [str(p.cpu_seconds), str(p.stack_bytes), str(p.output_bytes),
+                str(p.nproc), str(p.wall_ms)]
         args.insert(1, str(cgroup_procs) if cgroup_procs is not None else "")
         return args
 
@@ -676,25 +670,113 @@ def invoke_executor(command: list[str], env: Dict[str, str]) -> ExecutionReport:
         raise ExecutorError(str(exc)) from exc
 
 
-# ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────────────
-def _set_verdict(result: CaseResult, limits: Limits) -> None:
-    """仅根据可验证的资源数据和退出状态分类，不读取或猜测 stderr 内容。"""
-    if result.oom_events or result.oom_kills:
-        result.verdict, result.message = Verdict.MLE, "cgroup 记录了内存 OOM 事件"
-    elif result.timed_out:
-        result.verdict, result.message = Verdict.TLE, "wall-clock 超时，已终止提交进程组"
-    elif limits.memory_kb and result.memory_peak_bytes > limits.memory_kb * 1024:
-        result.verdict, result.message = Verdict.MLE, "cgroup 内存峰值超过题目限制"
-    elif (limits.time_ms and result.cpu_time_us > limits.time_ms * 1000) or result.signal == signal.SIGXCPU:
-        result.verdict, result.message = Verdict.TLE, "CPU 时间超限"
-    elif result.signal:
-        result.verdict, result.message = Verdict.RE, f"被信号 {result.signal} 终止"
-    elif result.exit_code:
-        result.verdict, result.message = Verdict.RE, f"非零退出码 {result.exit_code}"
-    else:
-        result.verdict = Verdict.OK
-    # 没有 OOM 证据时，SIGKILL/非零退出码仍为 RE；不能根据 stderr 猜 MLE。
+# ── step 01 · 集中限制计算与纯判定规则 ───────────────────────────────────────
+@dataclasses.dataclass(frozen=True)
+class ProtectionLimits:
+    """从题目阈值加余量算出的实际保护上限；字段直接表达 executor 需要的量。
+
+    这些值只用于“不让进程失控”，不参与最终判定。判定的比对对象始终是原始
+    题目阈值（Limits.time_ms / Limits.memory_kb），不因为多留了余量而放宽。
+    """
+
+    cpu_seconds: int
+    """CPU hard limit 秒数（阈值 + CPU 余量后向上取整）。"""
+
+    memory_max_bytes: int
+    """cgroup memory.max 字节数（阈值 + 内存余量）；0 表示不设。"""
+
+    wall_ms: int
+    """wall 看门狗毫秒数；0 表示不限。"""
+
+    stack_bytes: int
+    """栈限制字节数；0 表示不覆盖继承值。"""
+
+    output_bytes: int
+    """单个输出文件限制字节数；0 表示不设。"""
+
+    nproc: int
+    """同一真实 UID 的进程/线程数限制；0 表示不设。"""
+
+
+def make_protection_limits(limits: Limits) -> ProtectionLimits:
+    """把题目阈值换算成 executor 的保护参数（集中的唯一一处换算）。
+
+    负责：CPU 余量加完后向上取整成秒、内存与栈/输出换算成字节、0 关闭
+    对应限制。不负责判定——判定用原始阈值，见 classify_execution。
+    溢出到 executor 整数范围之外时抛 ValueError。
+    """
+    cpu_seconds = (limits.time_ms + limits.cpu_slack_ms + 999) // 1000 if limits.time_ms else 0
+    memory_max_bytes = limits.memory_max_bytes()
+    values = [cpu_seconds, limits.stack_mb * 1024 * 1024,
+              limits.output_limit_mb * 1024 * 1024, limits.nproc, limits.resolved_wall_ms(),
+              memory_max_bytes]
+    if any(value >= 2**63 - 1 for value in values):
+        raise ValueError("资源限制超出 executor 支持的整数范围")
+    return ProtectionLimits(
+        cpu_seconds=cpu_seconds,
+        memory_max_bytes=memory_max_bytes,
+        wall_ms=limits.resolved_wall_ms(),
+        stack_bytes=limits.stack_mb * 1024 * 1024,
+        output_bytes=limits.output_limit_mb * 1024 * 1024,
+        nproc=limits.nproc,
+    )
+
+
+@dataclasses.dataclass
+class MemoryResult:
+    """cgroup 内存统计；None 表示无 cgroup 时未测量（不得用 RSS 补位）。"""
+
+    peak_bytes: int
+    oom_events: int = 0
+    oom_kills: int = 0
+
+    @classmethod
+    def from_group(cls, stats: Dict[str, int]) -> "MemoryResult":
+        return cls(
+            peak_bytes=stats.get("memory_peak_bytes", 0),
+            oom_events=stats.get("oom_events", 0),
+            oom_kills=stats.get("oom_kills", 0),
+        )
+
+
+def classify_execution(report: ExecutionReport, memory: Optional[MemoryResult],
+                       limits: Limits) -> tuple[Verdict, str]:
+    """根据执行事实、内存统计和题目阈值返回执行结局与原因。
+
+    纯函数：不启动进程、不读文件、不操作 cgroup、不打印。混合证据的优先级
+    在这里一处决定（OOM → wall → 峰值 → CPU/SIGXCPU → 信号 → 退出码 → OK）。
+    没有 OOM 证据时不凭 SIGKILL 或 stderr 文本猜测 MLE。
+    返回 Verdict.OK 仅表示“可以比较答案”，不是最终测试点结果。
+    """
+    if memory is not None and (memory.oom_events or memory.oom_kills):
+        return Verdict.MLE, "cgroup 记录了内存 OOM 事件"
+    if report.timed_out:
+        return Verdict.TLE, "wall-clock 超时，已终止提交进程组"
+    if memory is not None and limits.memory_kb and memory.peak_bytes > limits.memory_kb * 1024:
+        return Verdict.MLE, "cgroup 内存峰值超过题目限制"
+    if (limits.time_ms and report.cpu_time_us > limits.time_ms * 1000) or report.signal == signal.SIGXCPU:
+        return Verdict.TLE, "CPU 时间超限"
+    if report.signal:
+        return Verdict.RE, f"被信号 {report.signal} 终止"
+    if report.exit_code:
+        return Verdict.RE, f"非零退出码 {report.exit_code}"
+    # 没有 OOM 证据时，SIGKILL/非零退出码仍为 RE；不根据 stderr 猜 MLE。
     # CPU 判断使用原始微秒数，cpu_time_ms 的四舍五入仅供展示。
+    return Verdict.OK, ""
+
+
+# ── 兼容层（下一步删除）：旧调用点仍写结果对象 ─────────────────────────────────
+def _set_verdict(result: CaseResult, limits: Limits) -> None:
+    """把 CaseResult 里的执行事实抽出来交给纯判定函数，写回结果对象。"""
+    report = ExecutionReport(
+        cpu_time_us=result.cpu_time_us, cpu_time_ms=result.cpu_time_ms,
+        real_time_ms=result.real_time_ms, rss_kb=result.rss_kb,
+        timed_out=result.timed_out, signal=result.signal, exit_code=result.exit_code,
+    )
+    memory = None
+    if result.memory_peak_bytes or result.oom_events or result.oom_kills:
+        memory = MemoryResult(result.memory_peak_bytes, result.oom_events, result.oom_kills)
+    result.verdict, result.message = classify_execution(report, memory, limits)
 
 
 # ── step 03 · 固定文件路径（第 04 章）────────────────────────────────────────
@@ -771,27 +853,27 @@ def run_case(
                 str(work_dir), str(input_path), str(output_path), str(stderr_path), *argv,
             ]
             report = invoke_executor(command, _child_env(work_dir, inherit_env))
-            memory: Dict[str, int] = {}
+            memory: Optional[MemoryResult] = None
             if group is not None:
                 # 直接子进程退出不代表所有后代都退出。先停止整个组，再读取最终
                 # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
                 group.stop()
-                memory = group.memory_result()
+                memory = MemoryResult.from_group(group.memory_result())
             # 执行事实 → 结果的适配（过渡形态）：下一步搬进 judge_case。
             result = CaseResult(
                 verdict=Verdict.OK, cpu_time_us=report.cpu_time_us,
                 cpu_time_ms=report.cpu_time_ms, real_time_ms=report.real_time_ms,
-                memory_peak_bytes=memory.get("memory_peak_bytes", 0),
-                memory_kb=memory.get("memory_peak_bytes", 0) // 1024,
+                memory_peak_bytes=memory.peak_bytes if memory else 0,
+                memory_kb=(memory.peak_bytes // 1024) if memory else 0,
                 rss_kb=report.rss_kb,
-                oom_events=memory.get("oom_events", 0),
-                oom_kills=memory.get("oom_kills", 0),
+                oom_events=memory.oom_events if memory else 0,
+                oom_kills=memory.oom_kills if memory else 0,
                 timed_out=report.timed_out, signal=report.signal,
                 exit_code=report.exit_code,
             )
         # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
         # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
-        _set_verdict(result, limits)
+        result.verdict, result.message = classify_execution(report, memory, limits)
     except (OSError, ExecutorError) as exc:
         result = CaseResult(message=str(exc))
 

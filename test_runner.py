@@ -15,7 +15,9 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 import judge
-from judge import (CaseResult, ExecutionReport, ExecutorError, Limits, Verdict, _set_verdict, invoke_executor, run_case)
+from judge import (CaseResult, ExecutionReport, ExecutorError, Limits, MemoryResult,
+                   ProtectionLimits, Verdict, _set_verdict, classify_execution,
+                   invoke_executor, make_protection_limits, run_case)
 
 
 class ExecutionTestsMixin:
@@ -539,21 +541,81 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(Limits(time_ms=0).helper_args(Path("/group/cgroup.procs"))[0], "0")
         self.assertEqual(Limits(memory_kb=0).memory_max_bytes(), 0)
 
+    def test_make_protection_limits_is_the_single_calculation_point(self):
+        p = make_protection_limits(Limits())
+        self.assertIsInstance(p, ProtectionLimits)
+        # CPU 阈值 1000ms + 200ms 余量，向上取整到秒。
+        self.assertEqual(p.cpu_seconds, 2)
+        self.assertEqual(p.memory_max_bytes, 144 * 1024 * 1024)
+        self.assertEqual(p.stack_bytes, 64 * 1024 * 1024)
+        self.assertEqual(p.output_bytes, 64 * 1024 * 1024)
+        # 0 关闭对应限制。
+        self.assertEqual(make_protection_limits(Limits(time_ms=0)).cpu_seconds, 0)
+        self.assertEqual(make_protection_limits(Limits(memory_kb=0)).memory_max_bytes, 0)
+        # 溢出要报错，而不是把一个荒谬的值传给 executor。
+        with self.assertRaises(ValueError):
+            make_protection_limits(Limits(time_ms=2**64))
+
     def test_microseconds_avoid_rounding_at_cpu_boundary(self):
         for cpu_us, expected in ((1000000, Verdict.OK), (1000001, Verdict.TLE)):
-            result = CaseResult(cpu_time_us=cpu_us, cpu_time_ms=1000)
-            _set_verdict(result, Limits())
-            self.assertEqual(result.verdict, expected)
+            report = ExecutionReport(cpu_time_us=cpu_us, cpu_time_ms=1000,
+                                     real_time_ms=1000, rss_kb=0,
+                                     timed_out=False, signal=0, exit_code=0)
+            verdict, _ = classify_execution(report, None, Limits())
+            self.assertEqual(verdict, expected)
 
     def test_memory_uses_exact_bytes_and_oom_evidence(self):
         limit = 128 * 1024 * 1024
+        ok = ExecutionReport(cpu_time_us=0, cpu_time_ms=0, real_time_ms=0,
+                             rss_kb=0, timed_out=False, signal=0, exit_code=0)
         for peak, expected in ((limit, Verdict.OK), (limit + 1, Verdict.MLE)):
-            result = CaseResult(memory_peak_bytes=peak)
-            _set_verdict(result, Limits())
-            self.assertEqual(result.verdict, expected)
-        result = CaseResult(oom_events=1, signal=signal.SIGKILL)
-        _set_verdict(result, Limits())
-        self.assertEqual(result.verdict, Verdict.MLE)
+            verdict, _ = classify_execution(
+                ok, MemoryResult(peak_bytes=peak), Limits())
+            self.assertEqual(verdict, expected)
+        # OOM 事件优先于一切其他证据，即使同时有 SIGKILL。
+        killed = ExecutionReport(cpu_time_us=0, cpu_time_ms=0, real_time_ms=0,
+                                 rss_kb=0, timed_out=False, signal=signal.SIGKILL,
+                                 exit_code=0)
+        verdict, _ = classify_execution(
+            killed, MemoryResult(peak_bytes=0, oom_events=1), Limits())
+        self.assertEqual(verdict, Verdict.MLE)
+
+    def _report(self, **overrides):
+        base = dict(cpu_time_us=0, cpu_time_ms=0, real_time_ms=0, rss_kb=0,
+                    timed_out=False, signal=0, exit_code=0)
+        base.update(overrides)
+        return ExecutionReport(**base)
+
+    def test_verdict_priority_table(self):
+        """混合证据的优先级：OOM → wall → 峰值 → CPU/SIGXCPU → 信号 → 退出码。"""
+        limit = Limits()
+        cases = [
+            # (说明, report, memory, 期望)
+            ("CPU 恰好等于阈值", self._report(cpu_time_us=1000 * 1000), None, Verdict.OK),
+            ("CPU 超 1 微秒", self._report(cpu_time_us=1000 * 1000 + 1), None, Verdict.TLE),
+            ("峰值恰好等于阈值", self._report(), MemoryResult(128 * 1024 * 1024), Verdict.OK),
+            ("峰值超 1 字节", self._report(), MemoryResult(128 * 1024 * 1024 + 1), Verdict.MLE),
+            ("OOM 与 wall 同时", self._report(timed_out=True),
+             MemoryResult(0, oom_kills=1), Verdict.MLE),
+            ("wall 与峰值超限、无 OOM", self._report(timed_out=True),
+             MemoryResult(200 * 1024 * 1024), Verdict.TLE),
+            ("SIGKILL 无其他证据", self._report(signal=signal.SIGKILL), None, Verdict.RE),
+            ("SIGXCPU", self._report(signal=signal.SIGXCPU), None, Verdict.TLE),
+            ("无 cgroup 时 RSS 很大不判 MLE",
+             self._report(rss_kb=10 * 1024 * 1024), None, Verdict.OK),
+            ("非零退出码", self._report(exit_code=3), None, Verdict.RE),
+        ]
+        for name, report, memory, expected in cases:
+            with self.subTest(name):
+                verdict, _ = classify_execution(report, memory, limit)
+                self.assertEqual(verdict, expected)
+
+    def test_zero_limits_disable_judgement(self):
+        # 时间/内存阈值为 0 时，即使用量很大也不因此判超限。
+        report = self._report(cpu_time_us=10**9)
+        verdict, _ = classify_execution(
+            report, MemoryResult(10**12), Limits(time_ms=0, memory_kb=0))
+        self.assertEqual(verdict, Verdict.OK)
 
 
 class BundledTestDataTests(unittest.TestCase):
