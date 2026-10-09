@@ -27,7 +27,7 @@ class MemoryCgroup:
             raise OSError(f"{self.root} 尚未为子组启用 memory controller")
         self.path.mkdir()
         try:
-            # 判定阈值由 runner 保存；这里的 memory.max 是更宽的保护上限。
+            # 判定阈值由 judge 保存；这里的 memory.max 是更宽的保护上限。
             (self.path / "memory.max").write_text(str(self.max_bytes) if self.max_bytes else "max")
             (self.path / "memory.swap.max").write_text("0")
             (self.path / "memory.oom.group").write_text("1")

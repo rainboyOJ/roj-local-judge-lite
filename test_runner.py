@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 import judge
-from runner import (CaseResult, ExecutionReport, ExecutorError, Limits, Verdict, _set_verdict, invoke_executor, run_case)
+from judge import (CaseResult, ExecutionReport, ExecutorError, Limits, Verdict, _set_verdict, invoke_executor, run_case)
 
 
 class ExecutionTestsMixin:
@@ -86,20 +86,14 @@ class ExecutionTestsMixin:
                                    cwd=self.root, drop_privileges=False)
         self.assertEqual(result.verdict, Verdict.OK, result.message)
 
-    def test_cli_reports_json_and_keeps_program_output_separate(self):
-        process = subprocess.run([
-            sys.executable, str(Path(__file__).with_name("runner.py")),
-            "--input", str(self.input), "--output", str(self.output),
-            "--no-drop-privileges", *self.cli_mode_args(), "--", sys.executable, "-c", "print('hello')",
-        ], capture_output=True, text=True, timeout=5)
-        self.assertEqual(process.returncode, 0, process.stderr)
-        report = json.loads(process.stdout)
-        self.assertEqual(report["verdict"], "OK")
-        if self.use_cgroup:
-            self.assertGreater(report["memory_kb"], 0)
-        else:
-            self.assertEqual(report["memory_kb"], 0)
-        self.assertEqual(self.output.read_text(), "hello\n")
+    def test_executor_report_keeps_program_output_separate(self):
+        # 原 runner CLI 的“报告与用户输出分离”测试，改为直接验证协议：
+        # 用户程序打印若干行 JSON 式文本，不能污染 executor 的报告；
+        # 提交的 stdout 全部落到输出文件。
+        payload = "[print('{\"verdict\": \"AC\"}') for _ in range(50)]"
+        result = self.run_python(payload)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
+        self.assertEqual(len(self.output.read_text().splitlines()), 50)
 
     def test_wall_timeout(self):
         result = self.run_python("import time; time.sleep(10)",
@@ -213,17 +207,26 @@ class ExecutionTestsMixin:
         self.assert_stopped(int(pidfile.read_text()))
 
     def test_interrupt_cleans_up_submission_group(self):
+        # 取消路径：向评测进程发 SIGINT，run_case 会把 KeyboardInterrupt
+        # 抛出并先让 executor 杀掉提交进程组（包括 fork 出的后代）。
+        # 原测试跑 runner CLI；该 CLI 已移除，这里用内联 harness 调用
+        # judge.run_case，保留同一条真实信号路径与进程清理断言。
         pidfile = self.root / "pids"
         source = (
             "import os, time\np = os.fork()\n"
             f"if p: open({str(pidfile)!r}, 'w').write(str(os.getpid()) + ' ' + str(p))\n"
             "time.sleep(10)\n"
         )
+        harness = (
+            "import sys; sys.path.insert(0, %r); import judge\n"
+            "from pathlib import Path\n"
+            "judge.run_case([sys.executable, '-c', sys.argv[4]], Path(sys.argv[1]),\n"
+            "              Path(sys.argv[2]), judge.Limits(time_ms=0),\n"
+            "              drop_privileges=False, use_cgroup=sys.argv[3] == '1')\n"
+        ) % str(Path(__file__).resolve().parent)
         process = subprocess.Popen([
-            sys.executable, str(Path(__file__).with_name("runner.py")),
-            "--input", str(self.input), "--output", str(self.output),
-            "--time", "0", "--no-drop-privileges", *self.cli_mode_args(), "--",
-            sys.executable, "-c", source,
+            sys.executable, "-c", harness,
+            str(self.input), str(self.output), "1" if self.use_cgroup else "0", source,
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
             deadline = time.monotonic() + 5
@@ -232,7 +235,8 @@ class ExecutionTestsMixin:
             self.assertTrue(pidfile.exists())
             process.send_signal(signal.SIGINT)
             process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 130)
+            # run_case 不捕获 KeyboardInterrupt，子进程以信号终止；
+            # 关键是它已杀掉并回收了提交进程组。
             for pid in pidfile.read_text().split():
                 self.assert_stopped(int(pid))
         finally:
