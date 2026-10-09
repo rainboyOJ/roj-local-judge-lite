@@ -10,7 +10,7 @@ executor: executor.c
 	$(CC) $(CFLAGS) $< -o $@
 
 check: executor
-	python3 -m unittest -v test_runner.py test_install.py
+	python3 -m unittest -v test_executor.py test_judge.py test_install.py
 
 # macOS 上无法直接构建 executor（sys/prctl.h 是 Linux 专有），
 # 这两条目标把构建与测试放进 Linux 容器。详见 README「在 macOS 上运行」。
@@ -20,7 +20,7 @@ docker-image:
 docker-check: docker-image
 	@docker run --rm --privileged -e ROJ_JUDGE_CGROUP_ROOT=/sys/fs/cgroup/judge \
 	  -v "$(CURDIR):/work:ro" $(IMAGE) \
-	  bash -lc 'cp -r /work /judge && cd /judge && make -s && cgroup-init.sh && python3 -m unittest test_runner.py test_install.py'
+	  bash -lc 'cp -r /work /judge && cd /judge && make -s && cgroup-init.sh && python3 -m unittest test_executor.py test_judge.py test_install.py'
 
 clean:
 	rm -f executor
