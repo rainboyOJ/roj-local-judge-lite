@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 import judge
-from runner import CaseResult, Limits, Verdict, _set_verdict, run_case
+from runner import (CaseResult, ExecutionReport, ExecutorError, Limits, Verdict, _set_verdict, invoke_executor, run_case)
 
 
 class ExecutionTestsMixin:
@@ -262,6 +262,98 @@ class ExecutionTestsMixin:
         )
         self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(self.output.read_text().strip(), "65534 65534 []")
+
+
+class ExecutionReportTests(unittest.TestCase):
+    """执行事实与判定的契约边界：报告解析、异常通道、取消传播。"""
+
+    def parse(self, text):
+        return ExecutionReport.from_json(text)
+
+    def test_valid_report_parses(self):
+        report = self.parse(json.dumps({
+            "cpu_time_us": 1500, "cpu_time_ms": 2, "real_time_ms": 3,
+            "rss_kb": 800, "timed_out": False, "signal": 0, "exit_code": 0,
+        }))
+        self.assertEqual(report.cpu_time_us, 1500)
+        self.assertFalse(report.timed_out)
+        # ExecutionReport 永远不携带评测标签。
+        self.assertFalse(hasattr(report, "verdict"))
+
+    def test_invalid_json_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("{not json")
+
+    def test_non_object_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(json.dumps([1, 2, 3]))
+
+    def test_missing_field_rejected_not_zero_filled(self):
+        data = {"cpu_time_us": 1, "cpu_time_ms": 0, "real_time_ms": 0,
+                "rss_kb": 0, "timed_out": False, "signal": 0}
+        # 故意少一个字段；绝不能变成全零成功报告。
+        with self.assertRaises(ValueError) as ctx:
+            self.parse(json.dumps(data))
+        self.assertIn("exit_code", str(ctx.exception))
+
+    def test_wrong_type_rejected(self):
+        data = {"cpu_time_us": "fast", "cpu_time_ms": 0, "real_time_ms": 0,
+                "rss_kb": 0, "timed_out": False, "signal": 0, "exit_code": 0}
+        with self.assertRaises(ValueError):
+            self.parse(json.dumps(data))
+
+    def test_bool_not_accepted_as_int(self):
+        data = {"cpu_time_us": True, "cpu_time_ms": 0, "real_time_ms": 0,
+                "rss_kb": 0, "timed_out": False, "signal": 0, "exit_code": 0}
+        with self.assertRaises(ValueError):
+            self.parse(json.dumps(data))
+
+    def test_unknown_field_rejected(self):
+        data = {"cpu_time_us": 0, "cpu_time_ms": 0, "real_time_ms": 0,
+                "rss_kb": 0, "timed_out": False, "signal": 0, "exit_code": 0,
+                "verdict": "AC"}  # 报告里永远不该出现评测标签
+        with self.assertRaises(ValueError):
+            self.parse(json.dumps(data))
+
+    def test_executor_failure_is_infrastructure_not_user_exit(self):
+        # 启动失败属于基础设施故障：invoke_executor 抛 ExecutorError。
+        env = {"PATH": os.environ.get("PATH", "/usr/bin")}
+        with self.assertRaises(ExecutorError) as ctx:
+            invoke_executor(["/no/such/executor-binary"], env)
+        self.assertIn("executor", str(ctx.exception))
+
+    def test_startup_failure_maps_to_system_error(self):
+        # run_case 是事务边界：基础设施故障必须转成 SYSTEM_ERROR。
+        # 用 --helper 指向不存在的二进制，确保是 executor 启动失败，
+        # 而不是提交程序路径无效。
+        with tempfile.TemporaryDirectory(prefix="executor-test-") as directory:
+            root = Path(directory)
+            (root / "in").write_text("1\n")
+            result = run_case(
+                [sys.executable, "-c", "pass"], root / "in", root / "out",
+                Limits(), drop_privileges=False, use_cgroup=False,
+                helper_path=root / "no-such-executor",
+            )
+        self.assertNotEqual(result.verdict, Verdict.RE)
+        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+
+    def test_user_exit_127_is_report_not_executor_error(self):
+        # 提交程序自己 exit 127 属于提交事实：报告里带 exit_code=127，
+        # 判为 RE；不能与启动失败（SYSTEM_ERROR）混同。
+        with tempfile.TemporaryDirectory(prefix="executor-test-") as directory:
+            root = Path(directory)
+            (root / "in").write_text("1\n")
+            result = run_case(
+                [sys.executable, "-c", "raise SystemExit(127)"],
+                root / "in", root / "out",
+                Limits(), drop_privileges=False, use_cgroup=False,
+            )
+        self.assertEqual(result.verdict, Verdict.RE)
+        self.assertEqual(result.exit_code, 127)
+
+    # 取消路径（Ctrl+C → executor 清理 → 退出码 130）已由
+    # ExecutionTestsMixin 的真实信号测试覆盖（见上方的 SIGINT 用例），
+    # 不在纯协议测试里重复模拟。
 
 
 class NoCgroupRunnerTests(ExecutionTestsMixin, unittest.TestCase):

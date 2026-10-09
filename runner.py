@@ -48,7 +48,7 @@ from typing import Dict, Optional
 
 from memory_cgroup import MemoryCgroup
 
-__all__ = ["Limits", "Verdict", "CaseResult", "run_case"]
+__all__ = ["Limits", "Verdict", "CaseResult", "ExecutionReport", "ExecutorError", "invoke_executor", "run_case"]
 
 
 # ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────────────
@@ -122,6 +122,73 @@ class Limits:
 
 # ── step 09 · 报告结果（第 05 章「第四步」）──────────────────────────────────
 @dataclasses.dataclass
+class ExecutionReport:
+    """executor 报告的执行事实：C JSON 报告的七个字段，不含判定。
+
+    判定（verdict）由 judge 根据这些事实加内存统计得出；本类型不携带任何
+    评测标签，也不为缺失字段生成默认成功——无效报告必须显式报错。
+    """
+
+    cpu_time_us: int
+    """精确 CPU 微秒数；判定用它，不用展示值。"""
+
+    cpu_time_ms: int
+    """C 侧按现有舍入方式得到的展示值。"""
+
+    real_time_ms: int
+    """wall 时间。"""
+
+    rss_kb: int
+    """wait4 的 ru_maxrss，仅辅助诊断，不用于内存判定。"""
+
+    timed_out: bool
+    """wall 看门狗是否触发。"""
+
+    signal: int
+    """提交因哪个信号终止；未发生时为 0。"""
+
+    exit_code: int
+    """提交正常退出时的退出码；被信号终止时为 0。"""
+
+    # JSON 字段清单与 executor 的输出一一对应；类型不符或缺字段都必须报错，
+    # 不能静默变成全零的“成功”报告。
+    _REQUIRED_TYPES = {
+        "cpu_time_us": int, "cpu_time_ms": int, "real_time_ms": int,
+        "rss_kb": int, "timed_out": bool, "signal": int, "exit_code": int,
+    }
+
+    @classmethod
+    def from_json(cls, text: str) -> "ExecutionReport":
+        """解析 executor 的 stdout JSON；无效报告抛 ValueError。
+
+        bool 是 int 的子类，所以先排除 bool 再检查 int，否则 timed_out
+        的检查会被 0/1 混过，int 字段也会接受 true/false。
+        """
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"executor 报告不是有效 JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"executor 报告必须是 JSON 对象，实际是 {type(data).__name__}")
+        missing = sorted(set(cls._REQUIRED_TYPES) - set(data))
+        if missing:
+            raise ValueError(f"executor 报告缺少字段: {', '.join(missing)}")
+        extra = sorted(set(data) - set(cls._REQUIRED_TYPES))
+        if extra:
+            raise ValueError(f"executor 报告出现未知字段: {', '.join(extra)}")
+        for name, expected in cls._REQUIRED_TYPES.items():
+            value = data[name]
+            if expected is int and type(value) is bool:
+                raise ValueError(f"executor 报告字段 {name} 应为整数，实际是布尔值")
+            if type(value) is not expected:
+                raise ValueError(
+                    f"executor 报告字段 {name} 应为 {expected.__name__}，"
+                    f"实际是 {type(value).__name__}")
+        fields = {name: data[name] for name in cls._REQUIRED_TYPES}
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class CaseResult:
     verdict: Verdict = Verdict.SYSTEM_ERROR
     cpu_time_us: int = 0
@@ -165,23 +232,39 @@ def _child_env(work_dir: Path, inherit: bool) -> Dict[str, str]:
     return env
 
 
-# ── step 06 · 启动 helper 并收回资源报告（第 09 章「第四步」）────────────────
-def _invoke_helper(command: list[str], env: Dict[str, str]) -> CaseResult:
-    """启动独立监控进程，并把它的资源报告转换成 Python 结果。
+# ── step 06 · 启动 executor 并收回执行报告（第 09 章「第四步」）────────────────
+class ExecutorError(RuntimeError):
+    """executor 本身的基础设施故障：启动、重定向、入组、exec、报告无效。
 
-    这里有两条不同的数据通道：helper 的 stdout 是 JSON 报告，用户程序
-    的 stdout 是输出文件。分开后，用户打印任意文本都不会破坏报告。
-    Python 只等待 helper；用户进程的 wait4 必须由其直接父进程 helper 做。
+    与“提交程序非零退出”严格区分——后者是执行事实，走报告的 exit_code；
+    本异常由 judge 映射为 SE，不能伪装成用户程序的退出行为。
     """
-    process = subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
-    )
+
+
+def invoke_executor(command: list[str], env: Dict[str, str]) -> ExecutionReport:
+    """启动 executor，等待监控结束，把 JSON 报告解析成 ExecutionReport。
+
+    两条数据通道严格分离：executor 的 stdout 是 JSON 报告，用户程序的
+    stdout 是输出文件，用户打印任意文本都不会污染报告。Python 只等待
+    executor；用户进程的 wait4 必须由其直接父进程 executor 完成。
+
+    executor 非零退出、报告无效都属于基础设施故障，抛 ExecutorError；
+    取消（Ctrl+C）先通知 executor 终止并等待它清理提交进程组，超宽限
+    后强杀，再原样重新抛出取消。
+    """
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
+        )
+    except OSError as exc:
+        # executor 不存在或无法启动：属于基础设施故障，不是提交程序的退出事实。
+        raise ExecutorError(f"无法启动 executor: {exc}") from exc
     try:
         stdout, stderr = process.communicate()
     except BaseException:
-        # Ctrl+C / 调用方异常时先让 helper 处理 SIGTERM：它会杀掉提交进程组并
-        # wait4 回收。不能只杀 helper，否则被测进程的后代可能继续留在后台。
+        # Ctrl+C / 调用方异常时先让 executor 处理 SIGTERM：它会杀掉提交进程组并
+        # wait4 回收。不能只杀 executor，否则被测进程的后代可能继续留在后台。
         process.terminate()
         try:
             process.communicate(timeout=5)
@@ -190,13 +273,12 @@ def _invoke_helper(command: list[str], env: Dict[str, str]) -> CaseResult:
             process.communicate()
         raise
     if process.returncode != 0:
-        raise RuntimeError(f"helper 失败（exit {process.returncode}）: {stderr.strip()}")
-    # helper 与 Python 属于同一个程序，JSON 字段就是 CaseResult 的资源字段。
-    # 直接构造结果，避免另外维护一套字段清单再用 setattr 逐个复制。
+        raise ExecutorError(
+            f"executor 失败（exit {process.returncode}）: {stderr.strip()}")
     try:
-        return CaseResult(**json.loads(stdout))
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError(f"helper 返回了无效的资源报告: {exc}") from exc
+        return ExecutionReport.from_json(stdout)
+    except ValueError as exc:
+        raise ExecutorError(str(exc)) from exc
 
 
 # ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────────────
@@ -290,24 +372,37 @@ def run_case(
         # 模式只决定是否包一层 cgroup 生命周期，下面的执行代码始终只有一份。
         context = MemoryCgroup(root, limits.memory_max_bytes()) if use_cgroup else nullcontext()
         with context as group:
-            # ── step 06 · 拼参数、备环境、启动 helper（第 09 章「第四步」）────────
+            # ── step 06 · 拼参数、备环境、启动 executor（第 09 章「第四步」）────────
             command = [
                 str(helper), *limits.helper_args(group.procs_path if group is not None else None),
                 str(int(drop_privileges)), str(run_uid), str(run_gid),
                 str(work_dir), str(input_path), str(output_path), str(stderr_path), *argv,
             ]
-            result = _invoke_helper(command, _child_env(work_dir, inherit_env))
+            report = invoke_executor(command, _child_env(work_dir, inherit_env))
+            memory: Dict[str, int] = {}
             if group is not None:
                 # ── step 07 · 收尾 cgroup 并补内存统计（第 08 章）────────────────
                 # 直接子进程退出不代表所有后代都退出。先停止整个组，再读取最终
                 # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
                 group.stop()
-                result = dataclasses.replace(result, **group.memory_result())
+                memory = group.memory_result()
+            # 执行事实 → 结果的适配（过渡形态）：这一步在后续提交中搬进 judge。
+            result = CaseResult(
+                verdict=Verdict.OK, cpu_time_us=report.cpu_time_us,
+                cpu_time_ms=report.cpu_time_ms, real_time_ms=report.real_time_ms,
+                memory_peak_bytes=memory.get("memory_peak_bytes", 0),
+                memory_kb=memory.get("memory_peak_bytes", 0) // 1024,
+                rss_kb=report.rss_kb,
+                oom_events=memory.get("oom_events", 0),
+                oom_kills=memory.get("oom_kills", 0),
+                timed_out=report.timed_out, signal=report.signal,
+                exit_code=report.exit_code,
+            )
         # ── step 08 · 按优先级判定（第 09 章「第五步」）──────────────────────
         # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
         # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
         _set_verdict(result, limits)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, ExecutorError) as exc:
         result = CaseResult(message=str(exc))
 
     # ── step 09 · 报告结果（第 05 章「第四步」）──────────────────────────────
