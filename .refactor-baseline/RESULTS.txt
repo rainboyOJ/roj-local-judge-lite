@@ -1,0 +1,47 @@
+行为基线（步骤 0，迁移前）
+========================
+日期: 2026-10-10
+命令: make check; python3 local_judge.py ...
+
+测试
+----
+make check        : OK, 67 tests, 29 skipped
+  - 29 skip = 需委派 cgroup 的 RunnerTests
+  - 38 通过 = DelegationModeTests + 其余 RunnerTests(无 cgroup 也能跑的) + InstallTests
+
+CLI 退出码与判定（--checker none）
+--------------------------------
+--list                          0  列出 testData/{1000,1005}
+AC  (std.cpp)                   0  10/10 AC
+WA  (a+b+1)                     1  0/10 WA，首行差异提示
+RE  (return 42)                 1  0/10 RE，detail "退出码 42"
+CE  (bad syntax)                2  编译器错误输出，无测试点循环
+TLE (长循环, 无 cgroup)         1  0/10 TLE，wall 超时，CPU≈1496ms
+MLE (无 cgroup)                 1  明确提示"MLE 无法判定"
+前置错误 (缺 --pid / 缺文件)     2  parser.error / stderr
+
+有 cgroup（自动委派成功）
+----------------------
+MLE (malloc 2.5GiB)             1  MLE，峰值 144.0MiB（128MiB + 16MiB slack 被超）
+AC                              0  cgroup 隔离，峰值 0.5MiB
+RE                              1  退出码 42
+
+cgroup 委派
+-----------
+执行 cgroup 隔离，root=/sys/fs/cgroup/user.slice/.../run-XXXX.scope
+（自动委派链路: SELF -> systemd-run --scope -> SELF --in-scope -> exec -> SELF）
+
+模块接口
+--------
+from runner import Limits, run_case, CaseResult, Verdict   OK
+runner.main 存在（第二套 Python CLI 入口）
+local_judge 不直接暴露 runner 名字（import 后 dir() 不含），但 import runner
+
+默认值（refactor.md §4 要求保留）
+------------------------------
+CPU 余量 200ms, 内存余量 16MiB, wall 自动余量 500ms,
+栈 64MiB, 输出 64MiB, nproc 默认关闭, UID/GID 65534
+
+JSON 报告字段（executor 契约, refactor.md §6）
+-------------------------------------------
+cpu_time_us, cpu_time_ms, real_time_ms, rss_kb, timed_out, signal, exit_code
