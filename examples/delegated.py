@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """在 systemd 委派的专用 scope 内准备测试/执行环境。
 
-供 runner.py、make check 和教程示例使用。local_judge.py 的自动委派不经过本脚本：
+供 runner.py、make check 和教程示例使用。judge.py 的自动委派不经过本脚本：
 它把同一套准备逻辑内联成 prepare_delegated_scope()，用 `--in-scope` 直接换壳重跑，
 省掉一层解释器启动。两处对“什么是合法的独占 scope”的判定必须保持一致。
 

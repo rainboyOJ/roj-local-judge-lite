@@ -20,7 +20,7 @@ class InstallTests(unittest.TestCase):
         self.package = Path(__file__).resolve().parent
         self.source = self.root / "source"
         self.source.mkdir()
-        for name in ("install.sh", "local_judge.py", "runner.py", "memory_cgroup.py"):
+        for name in ("install.sh", "judge.py", "runner.py", "memory_cgroup.py"):
             shutil.copyfile(self.package / name, self.source / name)
         self.installer = self.source / "install.sh"
         self.destination = self.root / "installed"

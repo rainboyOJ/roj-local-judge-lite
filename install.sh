@@ -85,7 +85,7 @@ done
 # 前置检查
 # ---------------------------------------------------------------------------
 
-[ -f "$SRC/local_judge.py" ] || die "$SRC 里找不到 local_judge.py，请在本仓库目录内运行 install.sh"
+[ -f "$SRC/judge.py" ] || die "$SRC 里找不到 judge.py，请在本仓库目录内运行 install.sh"
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3，请先安装"
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 8) else 1)' \
@@ -131,7 +131,7 @@ fi
 
 if [ "$DO_SMOKE" = 1 ]; then
     info "冒烟测试"
-    if ! ( cd "$pkg" && python3 -c "import local_judge, memory_cgroup, runner" ); then
+    if ! ( cd "$pkg" && python3 -c "import judge, memory_cgroup, runner" ); then
         die "模块导入失败"
     fi
     ok "模块导入正常"
@@ -147,15 +147,15 @@ if [ "$DO_SMOKE" = 1 ]; then
     fi
 
     cgroup_state="$( cd "$pkg" && python3 -c '
-import local_judge
-ready, why = local_judge.check_cgroup_root(local_judge.DEFAULT_CGROUP_ROOT)
+import judge
+ready, why = judge.check_cgroup_root(judge.DEFAULT_CGROUP_ROOT)
 print("ready" if ready else why)
 ' 2>&1 )" || cgroup_state="探测失败"
     if [ "$cgroup_state" = "ready" ]; then
         ok "cgroup v2 已可用，内存和 CPU 判定是精确的"
     else
         warn "cgroup v2 现在不可用（$cgroup_state）"
-        info "local_judge.py 会自动用 systemd-run 起委派 scope，再不行就降级为只限 wall 和 CPU"
+        info "judge.py 会自动用 systemd-run 起委派 scope，再不行就降级为只限 wall 和 CPU"
     fi
 
     if [ -z "$TESTDATA" ]; then
@@ -165,7 +165,7 @@ print("ready" if ready else why)
         done
     fi
     if [ -n "$TESTDATA" ] && [ -d "$TESTDATA" ]; then
-        if ( cd "$pkg" && python3 local_judge.py --testdata "$TESTDATA" --list >"$stage/list.log" 2>&1 ); then
+        if ( cd "$pkg" && python3 judge.py --testdata "$TESTDATA" --list >"$stage/list.log" 2>&1 ); then
             ok "测试数据可用：$TESTDATA（$(grep -c '个测试点' "$stage/list.log") 道题）"
         else
             warn "能读到 $TESTDATA，但 --list 失败："
@@ -200,7 +200,7 @@ if [ "$DO_LAUNCHER" = 1 ]; then
     cat >"$launcher" <<EOF
 #!/bin/sh
 # 由 roj-local-judge-lite 的 install.sh 生成；重新安装会覆盖本文件。
-exec python3 "$DEST/local_judge.py" "\$@"
+exec python3 "$DEST/judge.py" "\$@"
 EOF
     chmod 0755 "$launcher"
     ok "启动器已就绪：$launcher"

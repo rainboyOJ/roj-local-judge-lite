@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在容器内准备一个已委派且启用 memory controller 的 cgroup v2 父目录，
-# 供 local_judge.py --cgroup-root 使用。只操作自己创建的目录，不动系统其他组。
+# 供 judge.py --cgroup-root 使用。只操作自己创建的目录，不动系统其他组。
 #
 # 需要 --privileged（cgroup 文件系统在普通容器里是只读的）。
 set -u

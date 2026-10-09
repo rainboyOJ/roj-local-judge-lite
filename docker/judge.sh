@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在 Linux 容器里跑 local_judge.py，让 macOS 也能用这台评测机。
+# 在 Linux 容器里跑 judge.py，让 macOS 也能用这台评测机。
 #
 #   ./docker/judge.sh --pid 1000 solution.cpp
 #   ./docker/judge.sh --testdata ~/data/testData --pid 1000 solution.py
@@ -14,9 +14,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
   cat >&2 <<'EOF'
-用法：docker/judge.sh [local_judge.py 的参数...]
+用法：docker/judge.sh [judge.py 的参数...]
 
-参数原样转发给容器内的 python3 local_judge.py。额外支持：
+参数原样转发给容器内的 python3 judge.py。额外支持：
   --no-cgroup   不申请 --privileged，走降级模式（MLE 无法判定）
   --rebuild     强制重新构建镜像
   -h, --help    显示本帮助
@@ -106,10 +106,10 @@ for m in ${mounts[@]+"${mounts[@]}"}; do
 done
 
 if [ "$privileged" = 1 ]; then
-  inner=(bash -lc 'cp -r /work /judge && cd /judge && make -s && cgroup-init.sh && exec python3 /judge/local_judge.py "$@"' _
+  inner=(bash -lc 'cp -r /work /judge && cd /judge && make -s && cgroup-init.sh && exec python3 /judge/judge.py "$@"' _
          --cgroup-root /sys/fs/cgroup/judge)
 else
-  inner=(bash -lc 'cp -r /work /judge && cd /judge && make -s && exec python3 /judge/local_judge.py "$@"' _ --no-cgroup)
+  inner=(bash -lc 'cp -r /work /judge && cd /judge && make -s && exec python3 /judge/judge.py "$@"' _ --no-cgroup)
 fi
 
 # 仓库以只读方式挂载，容器内先拷一份再构建：避免把 Linux ELF runner_helper

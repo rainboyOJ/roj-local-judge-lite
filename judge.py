@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """本地评测工具：编译提交、跑 testData/<pid>/data 的测试点、比对答案并汇总结果。
 
-    python3 local_judge.py --pid 1000 solution.cpp
-    python3 local_judge.py --pid 1000 solution.py --testdata ../testData
+    python3 judge.py --pid 1000 solution.cpp
+    python3 judge.py --pid 1000 solution.py --testdata ../testData
 
 测试数据默认自动查找：先当前目录及其上级（你自己项目里的 testData/ 优先），
 再找包内自带的示例数据 testData/；也可以用 `--testdata` 直接指定。
@@ -52,7 +52,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# 同目录导入：允许直接 `python3 local_judge.py` 而不需要安装成包。
+# 同目录导入：允许直接 `python3 judge.py` 而不需要安装成包。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # 编译和比对留在 CLI；所有模式的执行、统计与判定统一交给公开的 run_case API。
@@ -281,7 +281,7 @@ def check_cgroup_root(root: Path) -> tuple[bool, str]:
 def _delegate_mode_args() -> list[str]:
     """root 没有自己的用户管理器，自动委派改用系统管理器。
 
-    `sudo python3 local_judge.py ...` 时 sudo 会重置环境（XDG_RUNTIME_DIR 消失），
+    `sudo python3 judge.py ...` 时 sudo 会重置环境（XDG_RUNTIME_DIR 消失），
     普通用户那条路走不通；而 systemd-run 的系统管理器本来就需要 root，正好对上。
     """
     return [] if os.geteuid() == 0 else ["--user"]
@@ -300,7 +300,7 @@ def delegation_blocker() -> str:
 def try_auto_delegate() -> tuple[bool, str]:
     """探测能否用 systemd-run 起一个委派 scope；成功则重新执行自己。
 
-    探测走的是与真实执行完全相同的命令形状（同一个 local_judge.py、同样的
+    探测走的是与真实执行完全相同的命令形状（同一个 judge.py、同样的
     `--in-scope --` 位置），只是把要跑的命令换成一句 print。这样“探测通过”
     就等于“真跑能准备好父目录”，不会出现探测过了、执行却失败的情况。
 
@@ -323,7 +323,7 @@ def try_auto_delegate() -> tuple[bool, str]:
 
 
 def _delegated_prefix() -> list[str]:
-    """构造 `systemd-run ... local_judge.py --in-scope -- <命令>` 的前缀。
+    """构造 `systemd-run ... judge.py --in-scope -- <命令>` 的前缀。
 
     --quiet 去掉 systemd-run 自己的 “Running as unit” 提示，但保留被测命令的
     stdout/stderr；--scope 让命令同步执行并原样传回退出码。
@@ -394,7 +394,7 @@ def run_in_scope(argv: list[str]) -> int:
     由 `_delegated_prefix()` 启动：argv 形如
 
         --in-scope -- <python> -c print(...)          # 探测
-        --in-scope -- <python> local_judge.py <原参数> --no-delegate   # 真实重跑
+        --in-scope -- <python> judge.py <原参数> --no-delegate   # 真实重跑
 
     `--` 后面是「要执行的命令」而不是本 CLI 的参数，所以两种用途共用同一条路径。
     用 execvp 而不是 subprocess：准备完之后本进程没有任何剩余状态，直接换掉最省事，
@@ -421,7 +421,7 @@ def run_in_scope(argv: list[str]) -> int:
 def run_delegated(raw_args: list[str]) -> int:
     """在委派 scope 里换壳重跑自己，返回退出码。
 
-    命令链是 `systemd-run --scope -- python3 local_judge.py --in-scope -- <原参数>`：
+    命令链是 `systemd-run --scope -- python3 judge.py --in-scope -- <原参数>`：
     systemd 先建 scope，`--in-scope` 分支在里面准备好父目录，再 os.execvp 回到同一个
     CLI、带着 ROJ_JUDGE_CGROUP_ROOT 直接命中隔离路径。没有额外的中间脚本。
 
@@ -489,13 +489,13 @@ def list_problems(testdata_root: Path, tried: list[Path]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="local_judge.py",
+        prog="judge.py",
         description="本地评测：编译提交、跑测试点、比对答案（不需要 judge_server）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例：
-  python3 local_judge.py --pid 1000 solution.cpp
-  python3 local_judge.py --list
-  python3 local_judge.py --pid 1000 solution.py --time 2000 --memory 256
+  python3 judge.py --pid 1000 solution.cpp
+  python3 judge.py --list
+  python3 judge.py --pid 1000 solution.py --time 2000 --memory 256
 """)
     parser.add_argument("source", nargs="?", type=Path, help="提交源文件（.cpp 或 .py）")
     parser.add_argument("--pid", help="题目编号，对应 testData/<pid>/")
@@ -540,7 +540,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
 
     # `--in-scope` 的 payload 是一条任意命令（探测时是 `python -c print(...)`，
-    # 真实重跑时是 `python local_judge.py <原参数>`），不能用本 CLI 的 parser 去解析，
+    # 真实重跑时是 `python judge.py <原参数>`），不能用本 CLI 的 parser 去解析，
     # 否则第一个 argparse 不认识的开关就会在进 in-scope 分支之前报错。
     if "--in-scope" in raw_args:
         return run_in_scope(raw_args)
@@ -556,7 +556,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.pid:
         parser.error("请用 --pid 指定题目编号，或先用 --list 查看可用题目")
     if args.source is None:
-        parser.error("请提供提交源文件，例如：python3 local_judge.py --pid 1000 solution.cpp")
+        parser.error("请提供提交源文件，例如：python3 judge.py --pid 1000 solution.cpp")
 
     source = args.source.resolve()
     if not source.is_file():

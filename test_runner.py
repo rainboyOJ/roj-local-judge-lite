@@ -14,7 +14,7 @@ import unittest
 from contextlib import redirect_stderr
 from unittest.mock import patch
 
-import local_judge
+import judge
 from runner import CaseResult, Limits, Verdict, _set_verdict, run_case
 
 
@@ -380,13 +380,13 @@ class LocalJudgeTests(unittest.TestCase):
             source.write_text("print(3)\n")
             tried = [root / "testData", root / "another" / "testData"]
             # 固定查找结果，避免测试意外使用开发机器上其他目录的题目数据。
-            with patch.object(local_judge, "resolve_testdata", return_value=(None, tried)), \
-                    patch.object(local_judge, "run_case") as run:
+            with patch.object(judge, "resolve_testdata", return_value=(None, tried)), \
+                    patch.object(judge, "run_case") as run:
                 for args in (["--pid", "1000", str(source)], ["--list"]):
                     with self.subTest(args=args):
                         error = io.StringIO()
                         with redirect_stderr(error):
-                            exit_code = local_judge.main(args)
+                            exit_code = judge.main(args)
                         self.assertEqual(exit_code, 2)
                         self.assertIn("找不到测试数据目录", error.getvalue())
                         self.assertIn("--testdata", error.getvalue())
@@ -416,7 +416,7 @@ class LocalJudgeTests(unittest.TestCase):
                 with self.subTest(verdict=verdict):
                     source.write_text(code)
                     process = subprocess.run([
-                        sys.executable, str(Path(__file__).with_name("local_judge.py")),
+                        sys.executable, str(Path(__file__).with_name("judge.py")),
                         "--pid", "1000", "--testdata", str(root / "testData"),
                         "--checker", "none", "--time", "1000", "--no-cgroup", str(source),
                     ], capture_output=True, text=True, timeout=10)
@@ -426,7 +426,7 @@ class LocalJudgeTests(unittest.TestCase):
 
             source.write_text(cases[0][0])
             process = subprocess.run([
-                sys.executable, str(Path(__file__).with_name("local_judge.py")),
+                sys.executable, str(Path(__file__).with_name("judge.py")),
                 "--pid", "1000", "--testdata", str(root / "testData"), "--checker", "none",
                 "--cgroup-root", str(root / "missing-cgroup"), "--no-delegate", str(source),
             ], capture_output=True, text=True, timeout=10)
@@ -477,9 +477,9 @@ class BundledTestDataTests(unittest.TestCase):
     def test_bundled_testdata_found_from_other_directory(self):
         # 装到 ~/.local/share 后并没有包上级的 testData/，必须能回退到包内自带的那份。
         for _ in self.chdir_elsewhere():
-            root, tried = local_judge.resolve_testdata(None)
+            root, tried = judge.resolve_testdata(None)
             self.assertIsNotNone(root, f"未找到包内自带测试数据：{tried}")
-            self.assertEqual(root, local_judge.PACKAGE_DIR / "testData")
+            self.assertEqual(root, judge.PACKAGE_DIR / "testData")
             self.assertTrue((root / "1000" / "data").is_dir())
             self.assertTrue((root / "1005" / "data").is_dir())
 
@@ -490,7 +490,7 @@ class BundledTestDataTests(unittest.TestCase):
             own.mkdir(parents=True)
             (own / "problem1.in").write_text("1\n")
             (own / "problem1.out").write_text("1\n")
-            root, _ = local_judge.resolve_testdata(None)
+            root, _ = judge.resolve_testdata(None)
             self.assertEqual(root, directory / "testData")
 
 
@@ -498,54 +498,54 @@ class DelegationModeTests(unittest.TestCase):
     """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
 
     def test_user_gets_user_manager(self):
-        with patch.object(local_judge.os, "geteuid", return_value=1000):
-            self.assertEqual(local_judge._delegate_mode_args(), ["--user"])
-            prefix = local_judge._delegated_prefix()
+        with patch.object(judge.os, "geteuid", return_value=1000):
+            self.assertEqual(judge._delegate_mode_args(), ["--user"])
+            prefix = judge._delegated_prefix()
         self.assertEqual(prefix[:4], ["systemd-run", "--user", "--quiet", "--scope"])
         # 委派不再经过 examples/delegated.py，而是让本 CLI 自己带 --in-scope 进场。
         self.assertEqual(prefix[-2:], ["--in-scope", "--"])
-        self.assertTrue(prefix[-3].endswith("local_judge.py"))
+        self.assertTrue(prefix[-3].endswith("judge.py"))
         self.assertNotIn("delegated.py", prefix)
 
     def test_delegated_command_appends_no_delegate_after_args(self):
-        # --no-delegate 是 local_judge.py 自己的参数，必须紧跟在原参数之后、
+        # --no-delegate 是 judge.py 自己的参数，必须紧跟在原参数之后、
         # 仍在 `--` 之后（它属于要执行的命令里那一个 CLI 调用）。
-        command = local_judge._delegated_command(["--pid", "1000", "sum.cpp"])
+        command = judge._delegated_command(["--pid", "1000", "sum.cpp"])
         # 取最后一个 `--` 之后的部分：第一个是 systemd-run 自己的分隔符。
         payload = command[command.index("--", command.index("--") + 1) + 1:]
         self.assertEqual(payload[-1], "--no-delegate")
         self.assertEqual(payload[-4:], ["--pid", "1000", "sum.cpp", "--no-delegate"])
         self.assertEqual(payload[0], sys.executable)
-        self.assertTrue(payload[1].endswith("local_judge.py"))
+        self.assertTrue(payload[1].endswith("judge.py"))
 
     def test_in_scope_requires_payload_after_separator(self):
         # `--in-scope` 之后必须跟 `--` 和要执行的命令，否则是内部调用出错。
         err = io.StringIO()
         with redirect_stderr(err):
-            self.assertEqual(local_judge.run_in_scope(["--in-scope"]), 2)
-            self.assertEqual(local_judge.run_in_scope(["--in-scope", "--"]), 2)
+            self.assertEqual(judge.run_in_scope(["--in-scope"]), 2)
+            self.assertEqual(judge.run_in_scope(["--in-scope", "--"]), 2)
         self.assertIn("--in-scope", err.getvalue())
 
     def test_root_uses_system_manager(self):
         # sudo 会清掉 XDG_RUNTIME_DIR，root 又没有用户管理器，所以必须换成系统管理器。
-        with patch.object(local_judge.os, "geteuid", return_value=0):
-            self.assertEqual(local_judge._delegate_mode_args(), [])
-            prefix = local_judge._delegated_prefix()
+        with patch.object(judge.os, "geteuid", return_value=0):
+            self.assertEqual(judge._delegate_mode_args(), [])
+            prefix = judge._delegated_prefix()
         self.assertEqual(prefix[:3], ["systemd-run", "--quiet", "--scope"])
         self.assertNotIn("--user", prefix)
 
     def test_blocker_ignores_missing_runtime_dir_for_root(self):
-        with patch.object(local_judge.shutil, "which", return_value="/usr/bin/systemd-run"):
+        with patch.object(judge.shutil, "which", return_value="/usr/bin/systemd-run"):
             with patch.dict(os.environ, {}, clear=True), \
-                    patch.object(local_judge.os, "geteuid", return_value=1000):
-                self.assertEqual(local_judge.delegation_blocker(), "缺少 XDG_RUNTIME_DIR")
+                    patch.object(judge.os, "geteuid", return_value=1000):
+                self.assertEqual(judge.delegation_blocker(), "缺少 XDG_RUNTIME_DIR")
             with patch.dict(os.environ, {}, clear=True), \
-                    patch.object(local_judge.os, "geteuid", return_value=0):
-                self.assertEqual(local_judge.delegation_blocker(), "")
+                    patch.object(judge.os, "geteuid", return_value=0):
+                self.assertEqual(judge.delegation_blocker(), "")
 
     def test_blocker_without_systemd_run(self):
-        with patch.object(local_judge.shutil, "which", return_value=None):
-            self.assertEqual(local_judge.delegation_blocker(), "未找到 systemd-run")
+        with patch.object(judge.shutil, "which", return_value=None):
+            self.assertEqual(judge.delegation_blocker(), "未找到 systemd-run")
 
 
 if __name__ == "__main__":
