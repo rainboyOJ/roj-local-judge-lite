@@ -277,7 +277,7 @@ def run_case(
     _check_stream_paths(input_path, output_path, stderr_path)
     # ── step 04 · 决定工作目录与执行身份（第 02、07 章）───────────────────────
     work_dir = Path(cwd or Path.cwd()).absolute()
-    helper = Path(helper_path or Path(__file__).with_name("runner_helper")).absolute()
+    helper = Path(helper_path or Path(__file__).with_name("executor")).absolute()
     if drop_privileges is None:
         drop_privileges = os.geteuid() == 0
 
@@ -339,7 +339,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--gid", type=int, default=65534)
     parser.add_argument("--no-drop-privileges", action="store_true")
     parser.add_argument("--inherit-env", action="store_true")
-    parser.add_argument("--helper", type=Path, help="预先构建的 runner_helper 路径")
+    parser.add_argument("--helper", type=Path, help="预先构建的 executor 路径")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- 后接可执行文件及其参数")
     args = parser.parse_args(argv)
     # step 10 · CLI 把参数翻译成一次 run_case 调用。

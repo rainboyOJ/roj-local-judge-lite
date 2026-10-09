@@ -112,7 +112,7 @@ else
   inner=(bash -lc 'cp -r /work /judge && cd /judge && make -s && exec python3 /judge/judge.py "$@"' _ --no-cgroup)
 fi
 
-# 仓库以只读方式挂载，容器内先拷一份再构建：避免把 Linux ELF runner_helper
+# 仓库以只读方式挂载，容器内先拷一份再构建：避免把 Linux ELF executor
 # 写回宿主机工作区（那个路径在 macOS 上不可执行，还会污染 git status）。
 exec docker run "${docker_args[@]}" \
   -v "$REPO_DIR:/work:ro" \

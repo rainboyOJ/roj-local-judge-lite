@@ -55,7 +55,7 @@ usage() {
   --dir <path>       安装目录（默认 ~/.local/share/roj-local-judge-lite）
   --bin-dir <path>   启动器目录（默认 ~/.local/bin）
   --testdata <path>  指定测试数据目录，仅用于安装后的冒烟测试
-  --no-build         不构建 runner_helper（跳过 cc/make 依赖）
+  --no-build         不构建 executor（跳过 cc/make 依赖）
   --no-smoke         跳过安装后的冒烟测试
   --no-launcher      不创建 ~/.local/bin 启动器
   -f, --force        目标目录已存在时直接覆盖
@@ -113,16 +113,16 @@ pkg="$stage/pkg"
 mkdir -p "$pkg"
 cp -a "$SRC/." "$pkg/"
 # 版本库元数据、构建产物和缓存都不该跟着安装包走；有就跑一次干净的 make。
-rm -rf "$pkg/.git" "$pkg/__pycache__" "$pkg/runner_helper"
+rm -rf "$pkg/.git" "$pkg/__pycache__" "$pkg/executor"
 
 if [ "$DO_BUILD" = 1 ]; then
-    info "构建 C helper（runner_helper）"
+    info "构建 C helper（executor）"
     if ! make -C "$pkg" >"$stage/make.log" 2>&1; then
         cat "$stage/make.log" >&2
         die "构建失败，请检查上面的编译错误"
     fi
-    [ -x "$pkg/runner_helper" ] || die "构建结束但没有生成 runner_helper"
-    ok "runner_helper 构建完成"
+    [ -x "$pkg/executor" ] || die "构建结束但没有生成 executor"
+    ok "executor 构建完成"
 fi
 
 # ---------------------------------------------------------------------------

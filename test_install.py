@@ -37,8 +37,8 @@ class InstallTests(unittest.TestCase):
 set -eu
 case "$1" in
     -C)
-        printf '#!/bin/sh\nexit 0\n' > "$2/runner_helper"
-        chmod +x "$2/runner_helper"
+        printf '#!/bin/sh\nexit 0\n' > "$2/executor"
+        chmod +x "$2/executor"
         ;;
     check)
         echo 'installer regression: check executed'
@@ -82,7 +82,7 @@ esac
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("单元测试通过", result.stdout)
-        self.assertTrue((self.destination / "runner_helper").is_file())
+        self.assertTrue((self.destination / "executor").is_file())
         self.assertTrue(os.access(self.launcher, os.X_OK))
         self.assertEqual(list(self.stage_dir.iterdir()), [])
 
@@ -90,7 +90,7 @@ esac
         result = self.install("--no-smoke")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("单元测试通过", result.stdout)
-        self.assertTrue((self.destination / "runner_helper").is_file())
+        self.assertTrue((self.destination / "executor").is_file())
         self.assertTrue(os.access(self.launcher, os.X_OK))
         self.assertEqual(list(self.stage_dir.iterdir()), [])
 

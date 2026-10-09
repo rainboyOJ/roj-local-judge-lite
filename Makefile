@@ -4,15 +4,15 @@ IMAGE ?= roj-local-judge-lite
 
 .PHONY: all check clean docker-image docker-check
 
-all: runner_helper
+all: executor
 
-runner_helper: runner_helper.c
+executor: executor.c
 	$(CC) $(CFLAGS) $< -o $@
 
-check: runner_helper
+check: executor
 	python3 -m unittest -v test_runner.py test_install.py
 
-# macOS 上无法直接构建 runner_helper（sys/prctl.h 是 Linux 专有），
+# macOS 上无法直接构建 executor（sys/prctl.h 是 Linux 专有），
 # 这两条目标把构建与测试放进 Linux 容器。详见 README「在 macOS 上运行」。
 docker-image:
 	@docker build -t $(IMAGE) -f docker/Dockerfile .
@@ -23,4 +23,4 @@ docker-check: docker-image
 	  bash -lc 'cp -r /work /judge && cd /judge && make -s && cgroup-init.sh && python3 -m unittest test_runner.py test_install.py'
 
 clean:
-	rm -f runner_helper
+	rm -f executor
