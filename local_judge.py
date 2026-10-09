@@ -19,6 +19,22 @@
 
 限制与判定口径来自 `runner.py`，本文件只负责串流程和展示。它不替代服务端判题，
 详细差异见本目录 README.md 的“与 judge_server 的差异”一节。
+
+执行顺序
+--------
+对应 docs/tutorial/10-judge-pipeline.md 的七步。**代码按职责分段，不按步号排列**，
+下表是「文章第 N 步 ↔ 本文件位置」的对照：
+
+    step 01  运行 CLI，把一份提交交给本地评测    main() 入口
+    step 02  解析参数、定位测试数据、读题目限制   resolve_testdata / load_cases / load_problem_meta
+    step 03  编译一次，之后所有测试点复用         compile_submission / detect_language
+    step 04  决定执行模式：隔离 / 自动委派 / 降级  check_cgroup_root / try_auto_delegate / run_delegated
+    step 05  逐测试点执行，只对 OK 的运行比答案    main() 里的测试点循环（run_case）
+    step 06  比对规则：内置按行比较 / 外部 checker normalize_lines / compare_output / first_difference
+    step 07  汇总、清理、返回退出码               main() 尾部与 finally
+
+注意 step 03 与 step 04 的**执行顺序和文章编号相反**：模式决策发生在编译之前，
+因为它可能直接重启整个 CLI。main() 里对应位置有说明。
 """
 
 from __future__ import annotations
@@ -56,7 +72,7 @@ LANG_BY_SUFFIX = {
 
 
 # --------------------------------------------------------------------------
-# 测试点发现与题目限制
+# step 02 · 测试点发现与题目限制（第 10 章「第二步」）
 # --------------------------------------------------------------------------
 
 
@@ -142,7 +158,7 @@ def load_problem_meta(problem_dir: Path) -> tuple[str, int, int]:
 
 
 # --------------------------------------------------------------------------
-# 编译
+# step 03 · 编译（第 10 章「第三步」）
 # --------------------------------------------------------------------------
 
 
@@ -193,7 +209,7 @@ def detect_language(source: Path, requested: Optional[str]) -> tuple[Optional[st
 
 
 # --------------------------------------------------------------------------
-# 输出比对
+# step 06 · 输出比对（第 10 章「第六步」）
 # --------------------------------------------------------------------------
 
 
@@ -238,7 +254,7 @@ def first_difference(expected_path: Path, user_output: Path) -> str:
 
 
 # --------------------------------------------------------------------------
-# cgroup 可用性与自动委派
+# step 04 · cgroup 可用性与自动委派（第 10 章「第四步」）
 # --------------------------------------------------------------------------
 
 
@@ -327,7 +343,7 @@ def run_delegated(raw_args: list[str]) -> int:
 
 
 # --------------------------------------------------------------------------
-# 展示
+# 展示（服务于 step 05 与 step 07 的输出）
 # --------------------------------------------------------------------------
 
 
@@ -371,7 +387,7 @@ def list_problems(testdata_root: Path, tried: list[Path]) -> int:
 
 
 # --------------------------------------------------------------------------
-# 主流程
+# 主流程：step 01 → step 07 的实际执行顺序
 # --------------------------------------------------------------------------
 
 
@@ -423,10 +439,13 @@ def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # ── step 01 · 运行 CLI：把一份提交交给本地评测 ────────────────────────
+    #    文章「第一步」那条命令背后执行的，就是这个函数。
     raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # ── step 02 · 解析参数、定位测试数据、读题目限制 ──────────────────────
     testdata_root, tried = resolve_testdata(args.testdata)
     if args.list:
         return list_problems(testdata_root, tried) if testdata_root else report_missing_testdata(tried)
@@ -468,8 +487,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         memory_mb = args.memory
     limits = Limits(time_ms=time_ms, memory_kb=memory_mb * 1024)
 
+    # ── step 06 · 比对规则：这里只决定用哪种比较器 ────────────────────────
+    #    具体规则在「输出比对」那一段（normalize_lines / compare_output）。
     checker, checker_note = resolve_checker(args.checker)
 
+    # ── step 04 · 决定执行模式 ────────────────────────────────────────────
+    #    注意：这一步排在 step 03（编译）之前，与文章编号顺序相反。
+    #    因为它可能用 run_delegated() 重启整个 CLI，后面的代码根本不会跑到。
     # 决定执行模式：cgroup 隔离 -> 自动委派重跑 -> 降级执行。
     cgroup_root = Path(args.cgroup_root or os.environ.get("ROJ_JUDGE_CGROUP_ROOT", DEFAULT_CGROUP_ROOT))
     isolated, reason = (False, "已用 --no-cgroup 禁用") if args.no_cgroup else check_cgroup_root(cgroup_root)
@@ -501,6 +525,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"比较 {checker_note}")
     print()
 
+    # ── step 03 · 编译一次，之后所有测试点复用同一个产物 ──────────────────
     work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
     if os.geteuid() == 0:
         # 降权后运行的提交需要能进入工作目录；judge_server 同样要处理这一点。
@@ -514,6 +539,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         print("编译通过")
 
+        # ── step 05 · 逐测试点执行，只对 OK 的运行比较答案 ────────────────
         started = time.monotonic()
         verdicts: list[str] = []
         for index, (name, input_path, expected_path) in enumerate(cases, start=1):
@@ -539,6 +565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 detail = result.message
             print(format_case_line(index, name, verdict, result, detail))
 
+        # ── step 07 · 汇总结果、返回退出码 ────────────────────────────────
         elapsed = time.monotonic() - started
         passed = verdicts.count("AC")
         # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
@@ -549,6 +576,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"工作目录：{work_dir}")
         return 0 if overall == "AC" else 1
     finally:
+        # step 07 的另一半：清理临时工作目录。
+        # 它与 run_case() 的进程/cgroup 清理各管一类资源。
         if not args.keep_work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 
