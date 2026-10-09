@@ -29,6 +29,7 @@
     step 02  解析参数、定位测试数据、读题目限制   resolve_testdata / load_cases / load_problem_meta
     step 03  编译一次，之后所有测试点复用         compile_submission / detect_language
     step 04  决定执行模式：隔离 / 自动委派 / 降级  check_cgroup_root / try_auto_delegate / run_delegated
+             委派细节：prepare_delegated_scope / run_in_scope
     step 05  逐测试点执行，只对 OK 的运行比答案    main() 里的测试点循环（run_case）
     step 06  比对规则：内置按行比较 / 外部 checker normalize_lines / compare_output / first_difference
     step 07  汇总、清理、返回退出码               main() 尾部与 finally
@@ -299,13 +300,18 @@ def delegation_blocker() -> str:
 def try_auto_delegate() -> tuple[bool, str]:
     """探测能否用 systemd-run 起一个委派 scope；成功则重新执行自己。
 
+    探测走的是与真实执行完全相同的命令形状（同一个 local_judge.py、同样的
+    `--in-scope --` 位置），只是把要跑的命令换成一句 print。这样“探测通过”
+    就等于“真跑能准备好父目录”，不会出现探测过了、执行却失败的情况。
+
     这样不必手工拼 `systemd-run [--user] --scope -p Delegate=yes`，
     也避免在容器等没有用户管理器的环境里报错退出。
     """
     blocker = delegation_blocker()
     if blocker:
         return False, blocker
-    probe = [*_delegated_prefix(), sys.executable, "-c", "print('local-judge-delegated-ok')"]
+    probe = [*_delegated_prefix(), sys.executable,
+             "-c", "print('local-judge-delegated-ok')"]
     try:
         proc = subprocess.run(probe, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -317,26 +323,116 @@ def try_auto_delegate() -> tuple[bool, str]:
 
 
 def _delegated_prefix() -> list[str]:
-    """构造 `systemd-run ... delegated.py <命令>` 的前缀。
+    """构造 `systemd-run ... local_judge.py --in-scope -- <命令>` 的前缀。
 
     --quiet 去掉 systemd-run 自己的 “Running as unit” 提示，但保留被测命令的
     stdout/stderr；--scope 让命令同步执行并原样传回退出码。
+
+    这里不再经过 examples/delegated.py：那个脚本是给 make check 和 runner.py 用的
+    通用演示入口，本工具自带同一套准备逻辑，省掉一层解释器启动。
     """
     return ["systemd-run", *_delegate_mode_args(), "--quiet", "--scope",
             "-p", "Delegate=yes", "--",
-            sys.executable, str(PACKAGE_DIR / "examples" / "delegated.py")]
+            sys.executable, str(Path(__file__).resolve()), "--in-scope", "--"]
+
+
+def _delegated_command(raw_args: list[str]) -> list[str]:
+    """把用户参数包成在委派 scope 里执行的完整命令。
+
+    `--` 之后是「要执行的命令」：重跑本 CLI，并带上原参数与 `--no-delegate`
+    防止子进程再次尝试委派。与探测共用同一个前缀形状。
+    """
+    return [*_delegated_prefix(), sys.executable, str(Path(__file__).resolve()),
+            *raw_args, "--no-delegate"]
+
+
+def prepare_delegated_scope() -> tuple[bool, str]:
+    """在 systemd-run 建立的 scope 内准备可委派的父目录（`--in-scope` 模式）。
+
+    与 examples/delegated.py 做的是同一件事：从 /proc/self/cgroup 反推出所在
+    scope 路径，确认它是本进程独占且可写的新 scope，再把执行器放进 manager
+    叶子组、为父目录启用 memory controller，最后设置 ROJ_JUDGE_CGROUP_ROOT。
+
+    为什么需要 manager 叶子组：cgroup v2 的 domain controller 要求管理目录本身
+    没有进程。先把执行器搬进一个不受管辖的叶子组，父目录才能安全地开启 +memory。
+
+    返回 (是否成功, 失败原因)。
+    """
+    try:
+        line = next(text for text in
+                    Path("/proc/self/cgroup").read_text().splitlines()
+                    if text.startswith("0::"))
+    except (OSError, StopIteration) as exc:
+        return False, f"无法从 /proc/self/cgroup 读取所在 scope：{exc}"
+    scope = line.split("::", 1)[1].strip()
+    root = Path("/sys/fs/cgroup") / scope.lstrip("/")
+    if not root.name.endswith(".scope") or not os.access(root, os.W_OK):
+        return False, "--in-scope 只能在 systemd-run --scope -p Delegate=yes 内使用"
+    try:
+        members = set((root / "cgroup.procs").read_text().split())
+        controllers = (root / "cgroup.controllers").read_text().split()
+    except OSError as exc:
+        return False, f"无法读取 {root} 的 cgroup 接口：{exc}"
+    if members != {str(os.getpid())}:
+        return False, f"{root} 不是本进程独占的新 scope，拒绝改动"
+    if "memory" not in controllers:
+        return False, f"{root} 没有可委派的 memory controller"
+    try:
+        manager = root / "manager"
+        manager.mkdir(exist_ok=True)
+        (manager / "cgroup.procs").write_text(str(os.getpid()))
+        (root / "cgroup.subtree_control").write_text("+memory")
+    except OSError as exc:
+        return False, f"准备委派父目录失败：{exc}"
+    os.environ["ROJ_JUDGE_CGROUP_ROOT"] = str(root)
+    return True, ""
+
+
+def run_in_scope(argv: list[str]) -> int:
+    """`--in-scope` 模式：准备委派父目录，再 exec `--` 后面的命令。
+
+    由 `_delegated_prefix()` 启动：argv 形如
+
+        --in-scope -- <python> -c print(...)          # 探测
+        --in-scope -- <python> local_judge.py <原参数> --no-delegate   # 真实重跑
+
+    `--` 后面是「要执行的命令」而不是本 CLI 的参数，所以两种用途共用同一条路径。
+    用 execvp 而不是 subprocess：准备完之后本进程没有任何剩余状态，直接换掉最省事，
+    退出码也天然透传。
+    """
+    separator = argv.index("--") if "--" in argv else -1
+    command = argv[separator + 1:] if separator >= 0 else []
+    if not command:
+        print("内部错误：--in-scope 后面缺少 `--` 与要执行的命令", file=sys.stderr)
+        return 2
+    ok, reason = prepare_delegated_scope()
+    if not ok:
+        print(f"无法在当前 scope 中准备委派目录：{reason}", file=sys.stderr)
+        return 2
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvp(command[0], command)
+    except OSError as exc:
+        print(f"在委派 scope 中执行命令失败：{exc}", file=sys.stderr)
+        return 2
 
 
 def run_delegated(raw_args: list[str]) -> int:
-    """在委派 scope 里重跑自己，返回子进程退出码。
+    """在委派 scope 里换壳重跑自己，返回退出码。
 
-    delegated.py 会设置 ROJ_JUDGE_CGROUP_ROOT，所以子进程直接走隔离路径；
-    追加 --no-delegate 防止它在子进程里再次尝试委派。
+    命令链是 `systemd-run --scope -- python3 local_judge.py --in-scope -- <原参数>`：
+    systemd 先建 scope，`--in-scope` 分支在里面准备好父目录，再 os.execvp 回到同一个
+    CLI、带着 ROJ_JUDGE_CGROUP_ROOT 直接命中隔离路径。没有额外的中间脚本。
+
+    用 execvp 而不是 subprocess：父进程的状态到这里已经没用，直接换掉可以少一个
+    进程、退出码天然透传；systemd-run 自己也是这个路子。
     """
-    command = [*_delegated_prefix(), sys.executable, str(Path(__file__).resolve()),
-               *raw_args, "--no-delegate"]
+    command = _delegated_command(raw_args)
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
-        return subprocess.call(command)
+        os.execvp(command[0], command)
     except OSError as exc:
         print(f"无法在委派 scope 中启动评测：{exc}", file=sys.stderr)
         return 2
@@ -442,6 +538,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ── step 01 · 运行 CLI：把一份提交交给本地评测 ────────────────────────
     #    文章「第一步」那条命令背后执行的，就是这个函数。
     raw_args = list(sys.argv[1:] if argv is None else argv)
+
+    # `--in-scope` 的 payload 是一条任意命令（探测时是 `python -c print(...)`，
+    # 真实重跑时是 `python local_judge.py <原参数>`），不能用本 CLI 的 parser 去解析，
+    # 否则第一个 argparse 不认识的开关就会在进 in-scope 分支之前报错。
+    if "--in-scope" in raw_args:
+        return run_in_scope(raw_args)
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -503,7 +606,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if may_delegate:
         delegated, delegate_reason = try_auto_delegate()
         if delegated:
-            # 交给子进程完整跑一遍并打印结果；本进程只转发退出码。
+            # run_delegated 用 execvp 换掉本进程，正常情况下不会返回。
             return run_delegated(raw_args)
         if args.delegate == "always":
             print(f"无法建立 cgroup 委派：{delegate_reason}", file=sys.stderr)

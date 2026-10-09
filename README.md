@@ -158,7 +158,8 @@ python3 runner.py --cgroup-root /sys/fs/cgroup/your-delegated-parent \
 ```
 
 也可设置环境变量 `ROJ_JUDGE_CGROUP_ROOT`。未指定时使用 `/sys/fs/cgroup/roj-judge`；
-这个默认路径也必须由部署环境预先准备，runner 不会自行配置系统目录。
+这个默认路径也必须由部署环境预先准备，runner 不会自行配置系统目录（想让它在
+重启后依然存在，见下文「让固定父目录开机后依然存在」）。
 
 ### 没有现成委派目录时
 
@@ -196,6 +197,55 @@ sudo chown "$USER" /sys/fs/cgroup/roj-judge   # 让普通用户也能建子组
 “管理目录自身不能有进程”的限制。之后 `ROJ_JUDGE_CGROUP_ROOT=/sys/fs/cgroup/roj-judge`
 或默认路径都能直接用。`docker/cgroup-init.sh` 在容器里做的就是同一件事（额外还要把
 root 里的进程迁走，因为容器里 `/sys/fs/cgroup` 自己也是管理目录）。
+
+### 让固定父目录开机后依然存在
+
+上面那三条命令重启后就没了：`/sys/fs/cgroup` 是 cgroup2 伪文件系统（tmpfs），每次
+开机都是空的。想让默认路径 `/sys/fs/cgroup/roj-judge` 一直可用——从而跳过自动委派、
+每次运行都直接走内存隔离——用 systemd 在早期启动阶段建一次：
+
+```bash
+sudo tee /etc/systemd/system/roj-judge-cgroup.service >/dev/null <<'EOF'
+[Unit]
+Description=Prepare delegated cgroup parent for roj-local-judge
+DefaultDependencies=no
+After=sysinit.target
+Before=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'mkdir -p /sys/fs/cgroup/roj-judge \
+  && echo +memory > /sys/fs/cgroup/roj-judge/cgroup.subtree_control \
+  && chown rainboy /sys/fs/cgroup/roj-judge'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+# 把 rainboy 换成运行评测的用户名（上一条命令里的 chown 目标）。
+# 写成 chown %u 是不对的：这是系统服务，默认以 root 运行，%u 会展开成 root，
+# 结果普通用户仍然建不了子组；除非同时加 User=rainboy 让 %u 指向该用户。
+sudo systemctl daemon-reload
+sudo systemctl enable --now roj-judge-cgroup.service
+```
+
+验证：
+
+```bash
+systemctl status roj-judge-cgroup.service
+cat /sys/fs/cgroup/roj-judge/cgroup.subtree_control   # 应包含 memory
+```
+
+写好后每次运行都会直接打印 `执行 cgroup 隔离，root=/sys/fs/cgroup/roj-judge`，不再
+经过 `systemd-run` 临时 scope。
+
+两点提醒：
+
+- **不要**把这段放进 `.bashrc` 之类的 shell 启动文件。cgroup v2 层次是全局的，不是
+  每个终端一份；目录用 `mkdir -p` 幂等虽然无害，但 `chown` 和 `subtree_control` 每次
+  重写既没必要也可能报错。
+- `tmpfiles.d` 也能建目录（`d /sys/fs/cgroup/roj-judge 0755 <user> <user> -`），但它
+  改不了 `cgroup.subtree_control`，`+memory` 仍须靠上面的服务或手动写入。
 
 ## 在 macOS 上运行
 

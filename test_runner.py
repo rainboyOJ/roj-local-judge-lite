@@ -502,7 +502,29 @@ class DelegationModeTests(unittest.TestCase):
             self.assertEqual(local_judge._delegate_mode_args(), ["--user"])
             prefix = local_judge._delegated_prefix()
         self.assertEqual(prefix[:4], ["systemd-run", "--user", "--quiet", "--scope"])
-        self.assertIn("delegated.py", prefix[-1])
+        # 委派不再经过 examples/delegated.py，而是让本 CLI 自己带 --in-scope 进场。
+        self.assertEqual(prefix[-2:], ["--in-scope", "--"])
+        self.assertTrue(prefix[-3].endswith("local_judge.py"))
+        self.assertNotIn("delegated.py", prefix)
+
+    def test_delegated_command_appends_no_delegate_after_args(self):
+        # --no-delegate 是 local_judge.py 自己的参数，必须紧跟在原参数之后、
+        # 仍在 `--` 之后（它属于要执行的命令里那一个 CLI 调用）。
+        command = local_judge._delegated_command(["--pid", "1000", "sum.cpp"])
+        # 取最后一个 `--` 之后的部分：第一个是 systemd-run 自己的分隔符。
+        payload = command[command.index("--", command.index("--") + 1) + 1:]
+        self.assertEqual(payload[-1], "--no-delegate")
+        self.assertEqual(payload[-4:], ["--pid", "1000", "sum.cpp", "--no-delegate"])
+        self.assertEqual(payload[0], sys.executable)
+        self.assertTrue(payload[1].endswith("local_judge.py"))
+
+    def test_in_scope_requires_payload_after_separator(self):
+        # `--in-scope` 之后必须跟 `--` 和要执行的命令，否则是内部调用出错。
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(local_judge.run_in_scope(["--in-scope"]), 2)
+            self.assertEqual(local_judge.run_in_scope(["--in-scope", "--"]), 2)
+        self.assertIn("--in-scope", err.getvalue())
 
     def test_root_uses_system_manager(self):
         # sudo 会清掉 XDG_RUNTIME_DIR，root 又没有用户管理器，所以必须换成系统管理器。
