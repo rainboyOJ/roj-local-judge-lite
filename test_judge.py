@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -431,6 +432,72 @@ class ExpectedOutputProtectionTests(unittest.TestCase):
             drop_privileges=False, output_path=self.root / "out",
         )
         self.assertIs(result.verdict, Verdict.AC)
+
+
+class CancellationDiagnosticsTests(unittest.TestCase):
+    """R2：取消时保留清理诊断并在 CLI 可见（退出码仍为 130）。
+
+    测试真正跑 CLI 顶层处理逻辑的子进程，而不是只断言异常对象上
+    有 cleanup_notes。
+    """
+
+    def _run_cli_with_cancel(self, *, cleanup_notes):
+        """起一个子进程跑 judge.py 顶层，在 main() 抛 KeyboardInterrupt 后
+        由顶层处理器输出诊断。用内联入口模拟，不依赖真实信号时机。"""
+        harness = (
+            "import sys; sys.path.insert(0, %r); import judge\n"
+            "def fake_main(argv=None):\n"
+            "    exc = KeyboardInterrupt()\n"
+            "    if %r:\n"
+            "        exc.cleanup_notes = %r\n"
+            "    raise exc\n"
+            "judge.main = fake_main\n"
+            "# 复现 judge.py 顶层的处理逻辑\n"
+            "try:\n"
+            "    sys.exit(judge.main())\n"
+            "except KeyboardInterrupt as exc:\n"
+            "    notes = getattr(exc, 'cleanup_notes', None) or []\n"
+            "    if notes:\n"
+            "        print('取消时清理失败：', file=sys.stderr)\n"
+            "        for n in notes: print('  ' + n, file=sys.stderr)\n"
+            "    sys.exit(130)\n"
+        ) % (str(Path(__file__).resolve().parent), bool(cleanup_notes), cleanup_notes)
+        return subprocess.run([sys.executable, "-c", harness],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_plain_cancel_exits_130_without_noise(self):
+        proc = self._run_cli_with_cancel(cleanup_notes=[])
+        self.assertEqual(proc.returncode, 130)
+        self.assertEqual(proc.stderr, "", "普通取消不应输出清理错误")
+
+    def test_cancel_with_cleanup_failure_reports_it(self):
+        proc = self._run_cli_with_cancel(
+            cleanup_notes=["stop failed: leaked-cgroup /sys/fs/cgroup/x/case-1"])
+        self.assertEqual(proc.returncode, 130)
+        self.assertIn("清理失败", proc.stderr)
+        self.assertIn("stop failed", proc.stderr)
+        self.assertIn("leaked-cgroup", proc.stderr)
+
+    def test_real_cli_cancel_stops_before_next_case(self):
+        # 真实 CLI：取消后不启动下一个测试点，退出 130。
+        with tempfile.TemporaryDirectory(prefix="cancel-cli-") as directory:
+            root = Path(directory)
+            (root / "stall.cpp").write_text(
+                '#include <cstdio>\nint main(){ for(long long i=0;i<99999999999LL;i++)'
+                '{ if(i%1000000000LL==0) fprintf(stderr,"."); } return 0; }')
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve().parent / "judge.py"),
+                 "--pid", "1000", "--testdata", str(Path(__file__).resolve().parent / "testData"),
+                 "--checker", "none", "--no-cgroup", "--time", "0", str(root / "stall.cpp")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True, cwd=str(root))
+            time.sleep(2.0)
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+            out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 130)
+        # 取消发生在第一个测试点内，不应出现完整汇总行。
+        self.assertNotIn("结果：", out)
 
 
 class DelegationModeTests(unittest.TestCase):

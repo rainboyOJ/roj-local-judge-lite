@@ -1273,5 +1273,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        # 取消：终止整次评测，退出码 130。
+        # 如果清理失败，诊断已附在异常上（MemoryCgroup.__exit__）；
+        # 用户应当知道可能残留的 cgroup 或进程，否则无从排查。
+        # 普通取消（无清理失败）不输出任何额外信息。
+        notes = getattr(exc, "cleanup_notes", None) or []
+        if notes:
+            print("取消时清理失败：", file=sys.stderr)
+            for note in notes:
+                print(f"  {note}", file=sys.stderr)
         sys.exit(130)
