@@ -1038,32 +1038,56 @@ def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
     return result
 
 
-def judge_submission(run_argv: list[str], cases: list[tuple[str, Path, Path]],
-                     limits: Limits, *, work_dir: Path, checker: Optional[Path],
-                     cgroup_root: Path, isolated: bool) -> int:
-    """编译好之后的完整评测：逐点调用 judge_case，展示并汇总。
+def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]],
+                     limits: Limits, *, checker: Optional[Path],
+                     cgroup_root: Path, isolated: bool,
+                     keep_work_dir: bool = False) -> int:
+    """一份提交的完整评测：管理工作目录，编译一次，逐点执行，汇总并清理。
 
-    只负责流程与汇总；单个测试点的资源生命周期在 judge_case 里。
-    展示、汇总都只读 CaseResult.verdict，不再维护另一份局部判定。
-    返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1。
+    资源边界：工作目录在进入后立即创建，并在 finally 里清理（除非
+    keep_work_dir），所以编译失败、执行异常、取消都经过同一个收尾。
+    单个测试点的资源生命周期在 judge_case 里；展示与汇总只读
+    CaseResult.verdict。
+
+    返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1，编译失败为 2。
     """
-    started = time.monotonic()
-    verdicts: list[str] = []
-    for index, (name, input_path, expected_path) in enumerate(cases, start=1):
-        result = judge_case(
-            run_argv, input_path, expected_path, limits, work_dir=work_dir,
-            index=index, checker=checker, cgroup_root=cgroup_root, isolated=isolated,
-        )
-        verdicts.append(result.verdict.value)
-        print(format_case_line(index, name, result))
+    work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
+    if os.geteuid() == 0:
+        # 降权后运行的提交需要能进入工作目录；judge_server 同样要处理这一点。
+        os.chmod(work_dir, 0o755)
+    try:
+        # 编译一次，之后所有测试点复用同一个产物。
+        run_argv, compile_output = compile_submission(lang, source, work_dir)
+        if run_argv is None:
+            print("编译失败（CE）：")
+            print(compile_output or "（编译器没有输出）")
+            return 2
+        print("编译通过")
 
-    elapsed = time.monotonic() - started
-    passed = verdicts.count("AC")
-    # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
-    overall = next((v for v in verdicts if v != "AC"), "AC")
-    print()
-    print(f"结果：{overall}  通过 {passed}/{len(cases)}  用时 {elapsed:.2f}s")
-    return 0 if overall == "AC" else 1
+        started = time.monotonic()
+        verdicts: list[str] = []
+        for index, (name, input_path, expected_path) in enumerate(cases, start=1):
+            result = judge_case(
+                run_argv, input_path, expected_path, limits, work_dir=work_dir,
+                index=index, checker=checker, cgroup_root=cgroup_root, isolated=isolated,
+            )
+            verdicts.append(result.verdict.value)
+            print(format_case_line(index, name, result))
+
+        # 计时口径保持为“测试点执行阶段”，不含编译时间。
+        elapsed = time.monotonic() - started
+        passed = verdicts.count("AC")
+        # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
+        overall = next((v for v in verdicts if v != "AC"), "AC")
+        print()
+        print(f"结果：{overall}  通过 {passed}/{len(cases)}  用时 {elapsed:.2f}s")
+        if keep_work_dir:
+            print(f"工作目录：{work_dir}")
+        return 0 if overall == "AC" else 1
+    finally:
+        # 与 judge_case 的进程/cgroup 清理各管一类资源。
+        if not keep_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1160,33 +1184,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"比较 {checker_note}")
     print()
 
-    # ── step 03 · 编译一次，之后所有测试点复用同一个产物 ──────────────────
-    work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
-    if os.geteuid() == 0:
-        # 降权后运行的提交需要能进入工作目录；judge_server 同样要处理这一点。
-        os.chmod(work_dir, 0o755)
-
-    try:
-        run_argv, compile_output = compile_submission(lang, source, work_dir)
-        if run_argv is None:
-            print("编译失败（CE）：")
-            print(compile_output or "（编译器没有输出）")
-            return 2
-        print("编译通过")
-
-        # ── step 05 · 逐测试点执行，只对 OK 的运行比较答案 ────────────────
-        exit_code = judge_submission(
-            run_argv, cases, limits, work_dir=work_dir, checker=checker,
-            cgroup_root=cgroup_root, isolated=isolated,
-        )
-        if args.keep_work_dir:
-            print(f"工作目录：{work_dir}")
-        return exit_code
-    finally:
-        # step 07 的另一半：清理临时工作目录。
-        # 它与 judge_case 的进程/cgroup 清理各管一类资源。
-        if not args.keep_work_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
+    # ── step 03 · 编译并逐点评测；工作目录与清理由 judge_submission 管理 ──
+    return judge_submission(
+        source, lang, cases, limits, checker=checker,
+        cgroup_root=cgroup_root, isolated=isolated,
+        keep_work_dir=args.keep_work_dir,
+    )
 
 
 if __name__ == "__main__":
