@@ -2,16 +2,18 @@
 
 make check；不需要 OJ 数据或 judge_server。"""
 
+import glob
 import io
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import time
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 import judge
@@ -498,6 +500,75 @@ class CancellationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 130)
         # 取消发生在第一个测试点内，不应出现完整汇总行。
         self.assertNotIn("结果：", out)
+
+
+class WorkDirCleanupBoundaryTests(unittest.TestCase):
+    """R3：工作目录从创建成功起就在清理边界内（包括权限设置失败）。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="workdir-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "sum.py"
+        self.source.write_text("print(3)\n")
+        self.data = self.root / "testData" / "1000" / "data"
+        self.data.mkdir(parents=True)
+        (self.data / "problem1.in").write_text("1\n")
+        (self.data / "problem1.out").write_text("3\n")
+        self.cases = [("problem1", self.data / "problem1.in",
+                       self.data / "problem1.out")]
+
+    def _submit(self, **kwargs):
+        return judge.judge_submission(
+            self.source, "python", self.cases, Limits(),
+            checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
+            **kwargs,
+        )
+
+    def _created_dirs(self):
+        before = set(glob.glob("/tmp/local-judge-*"))
+        return before
+
+    def test_chmod_failure_still_cleans_work_dir(self):
+        # 模拟 root 分支：chmod 抛 OSError。目录必须仍被清理，原错误可见。
+        before = set(glob.glob("/tmp/local-judge-*"))
+        with patch.object(judge.os, "geteuid", return_value=0), \
+                patch.object(judge.os, "chmod", side_effect=OSError("chmod failed")), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(OSError) as ctx:
+                self._submit()
+        self.assertIn("chmod failed", str(ctx.exception))
+        after = set(glob.glob("/tmp/local-judge-*"))
+        self.assertEqual(after, before, "chmod 失败后工作目录应被清理")
+
+    def test_chmod_failure_with_keep_work_dir_preserves_dir(self):
+        # keep_work_dir=True 的约定不变：即使是权限设置失败也保留目录。
+        before = set(glob.glob("/tmp/local-judge-*"))
+        with patch.object(judge.os, "geteuid", return_value=0), \
+                patch.object(judge.os, "chmod", side_effect=OSError("chmod failed")), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(OSError):
+                self._submit(keep_work_dir=True)
+        after = set(glob.glob("/tmp/local-judge-*"))
+        created = after - before
+        self.assertTrue(created, "keep_work_dir=True 应保留目录")
+        for path in created:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_normal_run_cleans_work_dir(self):
+        before = set(glob.glob("/tmp/local-judge-*"))
+        with redirect_stdout(io.StringIO()):
+            exit_code = self._submit()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(set(glob.glob("/tmp/local-judge-*")) - before, set())
+
+    def test_compile_failure_cleans_work_dir(self):
+        self.source.write_text("def broken(:\n")  # 真正无法编译的语法错误
+        before = set(glob.glob("/tmp/local-judge-*"))
+        with redirect_stdout(io.StringIO()):
+            exit_code = self._submit()
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(set(glob.glob("/tmp/local-judge-*")) - before, set())
 
 
 class DelegationModeTests(unittest.TestCase):

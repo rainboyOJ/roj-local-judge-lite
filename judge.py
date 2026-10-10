@@ -1130,10 +1130,12 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
     返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1，编译失败为 2。
     """
     work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
-    if os.geteuid() == 0:
-        # 降权后运行的提交需要能进入工作目录；judge_server 同样要处理这一点。
-        os.chmod(work_dir, 0o755)
     try:
+        # chmod 与编译、执行同在清理边界内：目录一旦建成就不会因
+        # 后续任何失败（包括权限设置失败）而遗留。
+        if os.geteuid() == 0:
+            # 降权后运行的提交需要能进入工作目录；judge_server 同样要处理这一点。
+            os.chmod(work_dir, 0o755)
         # 编译一次，之后所有测试点复用同一个产物。
         run_argv, compile_output = compile_submission(lang, source, work_dir)
         if run_argv is None:
