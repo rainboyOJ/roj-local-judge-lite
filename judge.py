@@ -30,7 +30,7 @@
     step 03  编译一次，之后所有测试点复用         compile_submission / detect_language
     step 04  决定执行模式：隔离 / 自动委派 / 降级  check_cgroup_root / try_auto_delegate / run_delegated
              委派细节：prepare_delegated_scope / run_in_scope
-    step 05  逐测试点执行，只对 OK 的运行比答案    main() 里的测试点循环（run_case）
+    step 05  逐测试点执行，只对 OK 的运行比答案    judge_case / judge_submission
     step 06  比对规则：内置按行比较 / 外部 checker normalize_lines / compare_output / first_difference
     step 07  汇总、清理、返回退出码               main() 尾部与 finally
 
@@ -446,7 +446,7 @@ def run_delegated(raw_args: list[str]) -> int:
 # --------------------------------------------------------------------------
 # 执行、统计与判定（原 runner.py 并入本文件）
 #
-# 一次 run_case() 的职责分段：限制口径 → 校验 → 固定路径 → 身份 → cgroup 生命
+# 一次 judge_case() 的职责分段：限制口径 → 校验 → 固定路径 → 身份 → cgroup 生命
 # 周期 → 启动 executor → 收尾统计 → 判定 → 报告结果。判定和限制计算属于
 # judge，启动 executor 与解析报告是唯一一处调用适配。
 # --------------------------------------------------------------------------
@@ -502,7 +502,7 @@ class Limits:
             if type(value) is not int or value < 0:
                 raise ValueError(f"{field.name} 必须是非负整数")
 
-    def helper_args(self, cgroup_procs: Optional[Path] = None) -> list[str]:
+    def executor_args(self, cgroup_procs: Optional[Path] = None) -> list[str]:
         """转换为 executor 的内部参数；顺序对应 C 中的 parse_options。
 
         保护值的计算集中在 make_protection_limits()；本方法只负责把结果
@@ -828,91 +828,26 @@ def _describe_failure(exc: BaseException) -> str:
     return message
 
 
-def run_case(
-    argv: list[str],
-    input_path: Path,
-    output_path: Path,
-    limits: Optional[Limits] = None,
-    *,
-    stderr_path: Optional[Path] = None,
-    cwd: Optional[Path] = None,
-    run_uid: int = 65534,
-    run_gid: int = 65534,
-    drop_privileges: Optional[bool] = None,
-    inherit_env: bool = False,
-    helper_path: Optional[Path] = None,
-    cgroup_root: Optional[Path] = None,
-    use_cgroup: bool = True,
-) -> CaseResult:
-    """执行一个已存在的程序，返回资源与退出状态。
-
-    输入、输出、stderr 路径相对于调用者当前目录；命令中的 ./路径 相对于 cwd。
-    cwd 默认是调用者当前目录。程序参数原样传递，不经过 shell。
-    root 默认降权至 nobody；普通用户默认保留身份。降权后程序必须能访问 cwd
-    和可执行文件，本函数不会修改目录权限。标准流在降权前打开。
-    默认要求 cgroup 可用，失败返回 SYSTEM_ERROR，不自动降低保护等级。
-    use_cgroup=False 时忽略 cgroup_root，不访问 cgroup；仍设置 CPU、wall、
-    栈、输出、进程数限制并执行降权。内存字段保留 0 表示未测量，rss_kb
-    只供诊断；此模式只能清理同一进程组，无法覆盖主动 setsid 的后代。
-    配置错误抛 ValueError，启动/重定向/executor 故障返回 SYSTEM_ERROR。
-    """
+def _prepare_execution(argv: list[str], input_path: Path, output_path: Path,
+                       limits: Limits, *, stderr_path: Optional[Path], cwd: Optional[Path],
+                       run_uid: int, run_gid: int, drop_privileges: Optional[bool],
+                       executor_path: Optional[Path]) -> tuple[list[str], Path, Path, Path, Path, bool]:
+    """参数校验与路径固定；返回 (argv, 工作目录, 输入, 输出, stderr, 是否降权)。"""
     if not argv:
         raise ValueError("argv 不能为空")
-    limits = limits or Limits()
     limits.validate()
     for name, value in (("run_uid", run_uid), ("run_gid", run_gid)):
         if type(value) is not int or not 0 <= value < 2**32 - 1:
             raise ValueError(f"{name} 必须是有效的非负 UID/GID")
-
     # 先固定文件路径：executor 改变 cwd 之后，重定向仍要指向调用者指定的文件。
     input_path = Path(input_path).absolute()
     output_path = Path(output_path).absolute()
     stderr_path = Path(stderr_path or str(output_path) + ".err").absolute()
     _check_stream_paths(input_path, output_path, stderr_path)
-    # 决定工作目录与执行身份。
     work_dir = Path(cwd or Path.cwd()).absolute()
-    helper = Path(helper_path or Path(__file__).with_name("executor")).absolute()
     if drop_privileges is None:
         drop_privileges = os.geteuid() == 0
-
-    # 准备 cgroup 生命周期。
-    root = Path(cgroup_root or os.environ.get("ROJ_JUDGE_CGROUP_ROOT", "/sys/fs/cgroup/roj-judge")).absolute()
-    try:
-        if not helper.is_file() or not os.access(helper, os.X_OK):
-            raise FileNotFoundError(f"找不到可执行的 executor: {helper}；请先在其源码目录运行 make")
-        # nullcontext 是“不做额外操作的 with”，进入后得到 None。
-        # 模式只决定是否包一层 cgroup 生命周期，下面的执行代码始终只有一份。
-        context = MemoryCgroup(root, limits.memory_max_bytes()) if use_cgroup else nullcontext()
-        with context as group:
-            # 拼参数、备环境、启动 executor。
-            command = [
-                str(helper), *limits.helper_args(group.procs_path if group is not None else None),
-                str(int(drop_privileges)), str(run_uid), str(run_gid),
-                str(work_dir), str(input_path), str(output_path), str(stderr_path), *argv,
-            ]
-            report = invoke_executor(command, _child_env(work_dir, inherit_env))
-            memory: Optional[MemoryResult] = None
-            if group is not None:
-                # 直接子进程退出不代表所有后代都退出。先停止整个组，再读取最终
-                # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
-                group.stop()
-                memory = MemoryResult.from_group(group.memory_result())
-            # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
-            # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
-            verdict, message = classify_execution(report, memory, limits)
-            result = CaseResult(verdict=verdict, message=message,
-                                report=report, memory=memory)
-    except KeyboardInterrupt:
-        # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
-        # 清理失败已作为诊断挂在异常上（见 MemoryCgroup.__exit__）。
-        raise
-    except (OSError, ExecutorError) as exc:
-        # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
-        result = CaseResult(verdict=Verdict.SE, message=_describe_failure(exc))
-
-    result.output_path = str(output_path)
-    result.stderr_path = str(stderr_path)
-    return result
+    return argv, work_dir, input_path, output_path, stderr_path, bool(drop_privileges)
 
 
 # --------------------------------------------------------------------------
@@ -1016,33 +951,90 @@ def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
 
 def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
                limits: Limits, *, work_dir: Path, index: int, checker: Optional[Path],
-               cgroup_root: Path, isolated: bool) -> CaseResult:
-    """一个测试点的事务：执行 → 资源收尾 → 判定 → 比较答案。
+               cgroup_root: Path, isolated: bool,
+               run_uid: int = 65534, run_gid: int = 65534,
+               drop_privileges: Optional[bool] = None, inherit_env: bool = False,
+               executor_path: Optional[Path] = None,
+               output_path: Optional[Path] = None,
+               stderr_path: Optional[Path] = None,
+               cwd: Optional[Path] = None) -> CaseResult:
+    """一个测试点的完整事务：创建组 → 执行 → 停止后代 → 读统计 → 删组
+    → 判定 → 比较答案。返回值就是最终结果（AC/WA/TLE/MLE/RE/SE）。
 
-    返回单个 CaseResult，其 verdict 就是最终判定（AC/WA/TLE/MLE/RE/SE）。
-    内部的 OK 不会成为最终结果：只有执行正常（OK）才比较答案，得到 AC/WA。
+    这里能看到完整的资源生命周期：`with MemoryCgroup(...)` 包住创建与清理
+    （无 cgroup 时用空上下文），executor 的启动与报告解析交给
+    invoke_executor()，限制换算交给 make_protection_limits()，判定交给
+    classify_execution()。cgroup 文件操作仍全部在 MemoryCgroup 里，
+    本函数不复制它们。
 
-    资源生命周期由 run_case 用 `with MemoryCgroup(...)` 包住
-    （创建→执行→停止→读统计→删除，无 cgroup 时用空上下文），所以这里
-    看不到 cgroup 文件操作，只有一次调用。
+    只有执行正常（内部 OK）才比较答案，得到 AC/WA；内部 OK 和
+    SYSTEM_ERROR 都不会作为最终结果出现。取消（KeyboardInterrupt）
+    不被吸收，向顶层传播。
+
+    output_path 省略时用 work_dir/case-{index}.out；调用方可指定以自管输出。
     """
-    user_output = work_dir / f"case-{index}.out"
-    stderr_path = work_dir / f"case-{index}.err"
-    # CLI 只选择能力，不实现第二套执行器。没有 cgroup 时仍由 executor
-    # 设置限额、降权并回收进程组；区别是没有内存计量和 MLE 判定。
-    result = run_case(
-        run_argv, input_path, user_output, limits,
-        stderr_path=stderr_path, cwd=work_dir,
-        cgroup_root=cgroup_root, use_cgroup=isolated,
-    )
-    # 只有执行正常时才看答案——OK 是内部中间态，在此处收口成 AC/WA。
-    if result.verdict is Verdict.OK:
-        ac = compare_output(input_path, expected_path, user_output, checker)
-        result.verdict = Verdict.AC if ac else Verdict.WA
-        if not ac:
-            result.message = first_difference(expected_path, user_output)
-    elif result.verdict is Verdict.SYSTEM_ERROR:
-        result.verdict = Verdict.SE
+    output_dir = Path(cwd) if cwd else work_dir
+    user_output = Path(output_path) if output_path else output_dir / f"case-{index}.out"
+    if stderr_path is not None:
+        stderr_path = Path(stderr_path)
+    elif output_path:
+        stderr_path = user_output.with_suffix(user_output.suffix + ".err")
+    else:
+        stderr_path = output_dir / f"case-{index}.err"
+    limits = limits or Limits()
+    executor = Path(executor_path or Path(__file__).with_name("executor")).absolute()
+
+    try:
+        argv, work_dir_abs, input_abs, output_abs, stderr_abs, drop = _prepare_execution(
+            run_argv, input_path, user_output, limits, stderr_path=stderr_path,
+            cwd=cwd or work_dir, run_uid=run_uid, run_gid=run_gid,
+            drop_privileges=drop_privileges, executor_path=executor,
+        )
+        protection = make_protection_limits(limits)
+        if not executor.is_file() or not os.access(executor, os.X_OK):
+            raise FileNotFoundError(
+                f"找不到可执行的 executor: {executor}；请先在其源码目录运行 make")
+        root = Path(cgroup_root or os.environ.get(
+            "ROJ_JUDGE_CGROUP_ROOT", "/sys/fs/cgroup/roj-judge")).absolute()
+        # 无 cgroup 用空上下文；两种模式的执行代码只有一份。
+        context = MemoryCgroup(root, protection.memory_max_bytes) if isolated else nullcontext()
+        with context as group:
+            command = [
+                str(executor), *limits.executor_args(group.procs_path if group is not None else None),
+                str(int(drop)), str(run_uid), str(run_gid),
+                str(work_dir_abs), str(input_abs), str(output_abs), str(stderr_abs), *argv,
+            ]
+            report = invoke_executor(command, _child_env(work_dir_abs, inherit_env))
+            memory: Optional[MemoryResult] = None
+            if group is not None:
+                # 直接子进程退出不代表所有后代都退出。先停止整个组，再读取最终
+                # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
+                group.stop()
+                memory = MemoryResult.from_group(group.memory_result())
+            # 没有 cgroup 就没有内存超限证据，不拿 rss_kb 补位。
+            verdict, message = classify_execution(report, memory, limits)
+            result = CaseResult(verdict=verdict, message=message,
+                                report=report, memory=memory)
+        # 只有执行正常时才看答案——OK 是内部中间态，在此收口成 AC/WA。
+        if result.verdict is Verdict.OK:
+            ac = compare_output(input_abs, Path(expected_path).absolute(),
+                                output_abs, checker)
+            result.verdict = Verdict.AC if ac else Verdict.WA
+            if not ac:
+                result.message = first_difference(Path(expected_path).absolute(), output_abs)
+    except KeyboardInterrupt:
+        # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
+        # 清理失败已作为诊断挂在异常上（见 MemoryCgroup.__exit__）。
+        raise
+    except (OSError, ExecutorError) as exc:
+        # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
+        # ValueError（配置/路径错误）不在此处捕获：那是调用方的编程错误，
+        # 应在启动任何进程之前抛出，而不是变成一个测试点的 SE。
+        return CaseResult(verdict=Verdict.SE, message=_describe_failure(exc),
+                          output_path=str(user_output), stderr_path=str(stderr_path))
+
+    result.output_path = str(user_output)
+    result.stderr_path = str(stderr_path)
     return result
 
 
@@ -1192,7 +1184,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return exit_code
     finally:
         # step 07 的另一半：清理临时工作目录。
-        # 它与 judge_case 里 run_case 的进程/cgroup 清理各管一类资源。
+        # 它与 judge_case 的进程/cgroup 清理各管一类资源。
         if not args.keep_work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 

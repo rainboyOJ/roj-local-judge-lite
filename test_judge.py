@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import judge
 from judge import (ExecutionReport, ExecutorError, Limits, MemoryResult, ProtectionLimits, Verdict,
-                   classify_execution, judge_case, make_protection_limits, run_case)
+                   classify_execution, judge_case, make_protection_limits)
 
 
 class LocalJudgeTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class LocalJudgeTests(unittest.TestCase):
             tried = [root / "testData", root / "another" / "testData"]
             # 固定查找结果，避免测试意外使用开发机器上其他目录的题目数据。
             with patch.object(judge, "resolve_testdata", return_value=(None, tried)), \
-                    patch.object(judge, "run_case") as run:
+                    patch.object(judge, "judge_case") as run:
                 for args in (["--pid", "1000", str(source)], ["--list"]):
                     with self.subTest(args=args):
                         error = io.StringIO()
@@ -84,9 +84,9 @@ class LocalJudgeTests(unittest.TestCase):
 class LimitsTests(unittest.TestCase):
     def test_protection_limits_include_margin(self):
         limits = Limits()
-        self.assertEqual(limits.helper_args(Path("/group/cgroup.procs"))[0], "2")
+        self.assertEqual(limits.executor_args(Path("/group/cgroup.procs"))[0], "2")
         self.assertEqual(limits.memory_max_bytes(), 144 * 1024 * 1024)
-        self.assertEqual(Limits(time_ms=0).helper_args(Path("/group/cgroup.procs"))[0], "0")
+        self.assertEqual(Limits(time_ms=0).executor_args(Path("/group/cgroup.procs"))[0], "0")
         self.assertEqual(Limits(memory_kb=0).memory_max_bytes(), 0)
 
     def test_make_protection_limits_is_the_single_calculation_point(self):
@@ -361,7 +361,7 @@ class JudgeCaseResultTests(unittest.TestCase):
             Limits(), work_dir=self.work, index=1, checker=None,
             cgroup_root=self.work / "missing", isolated=False,
         )
-        # 无 cgroup 模式下 executor 仍存在，应正常 AC；用不存在的 helper 才能造 SE。
+        # 无 cgroup 模式下 executor 仍存在，应正常 AC；用不存在的 executor 才能造 SE。
         self.assertIn(result.verdict, (Verdict.AC, Verdict.SE))
 
     def test_checker_only_runs_when_execution_ok(self):
