@@ -290,6 +290,9 @@ class ExecutionTestsMixin:
         result = self.run_case(
             [sys.executable, "-c", "import os; print(os.getuid(), os.getgid(), os.getgroups())"],
             self.input, self.output, Limits(), cwd=self.root,
+            # 显式传 None：验证“由运行身份决定是否降权”的默认行为。
+            # 夹具默认 False（普通测试不需要降权），直接传 True 验证的是强制降权。
+            drop_privileges=None,
         )
         self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(self.output.read_text().strip(), "65534 65534 []")

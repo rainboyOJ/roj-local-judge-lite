@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import judge
 from judge import (ExecutionReport, ExecutorError, Limits, MemoryResult, ProtectionLimits, Verdict,
-                   classify_execution, judge_case, make_protection_limits)
+                   classify_execution, execute_program, judge_case, make_protection_limits)
 
 
 class LocalJudgeTests(unittest.TestCase):
@@ -569,6 +569,40 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
             exit_code = self._submit()
         self.assertEqual(exit_code, 2)
         self.assertEqual(set(glob.glob("/tmp/local-judge-*")) - before, set())
+
+
+class ExecutionPathReportingTests(unittest.TestCase):
+    """R2：返回的 output/stderr 路径必须指向实际生成的文件。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="path-report-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "in"
+        self.input.write_text("1\n")
+        self.script = [sys.executable, "-c",
+                       "import sys; sys.stdout.write('o\\n'); sys.stderr.write('diagnostic\\n')"]
+
+    def _run(self, output, **kwargs):
+        return execute_program(
+            self.script, self.input, output, Limits(), work_dir=self.root,
+            drop_privileges=False, isolated=False,
+            cgroup_root=self.root / "no-cgroup", **kwargs,
+        )
+
+    def test_default_stderr_path_is_reported(self):
+        result = self._run(self.root / "out")
+        self.assertTrue(result.stderr_path, "默认 stderr 路径必须写入结果")
+        self.assertTrue(Path(result.stderr_path).is_file())
+        self.assertEqual(Path(result.stderr_path).read_text(), "diagnostic\n")
+        # output 路径也要与实际一致。
+        self.assertEqual(Path(result.output_path).read_text(), "o\n")
+
+    def test_explicit_stderr_path_is_reported(self):
+        custom = self.root / "my.err"
+        result = self._run(self.root / "out2", stderr_path=custom)
+        self.assertEqual(Path(result.stderr_path), custom)
+        self.assertEqual(custom.read_text(), "diagnostic\n")
 
 
 class DelegationModeTests(unittest.TestCase):

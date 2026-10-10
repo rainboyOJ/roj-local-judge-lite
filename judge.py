@@ -1050,10 +1050,14 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
         # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
         # ValueError（配置/路径错误）不在此处捕获：那是调用方的编程错误，
         # 应在启动任何进程之前抛出，而不是变成一个测试点的 SE。
+        # 配置准备可能尚未算出绝对路径（_prepare_execution 抛错），
+        # 所以这里退回调用方传入的原值，不引用未赋值的局部变量。
         return CaseResult(verdict=Verdict.SE, message=_describe_failure(exc),
                           output_path=str(output_path), stderr_path=str(stderr_path or ""))
-    result.output_path = str(output_path)
-    result.stderr_path = str(stderr_path or "")
+    # 返回路径与实际执行使用的绝对路径一致：调用方省略 stderr 时，
+    # 也能据此找到 executor 实际写入的 .err 文件。
+    result.output_path = str(output_abs)
+    result.stderr_path = str(stderr_abs)
     return result
 
 
