@@ -620,56 +620,99 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
                        self.data / "problem1.out")]
 
     def _submit(self, **kwargs):
-        return judge.judge_submission(
-            self.source, "python", self.cases, Limits(),
-            checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
-            **kwargs,
-        )
+        """跑一次 judge_submission，并记录它实际创建的 work_dir。
 
-    def _created_dirs(self):
-        before = set(glob.glob("/tmp/local-judge-*"))
-        return before
+        不用 glob 扫 /tmp：那会把其他测试（或并行进程）同时创建的目录算进来，
+        导致间歇性误报。这里包住 tempfile.mkdtemp，只盯自己的那一个。
+        """
+        created: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def tracking_mkdtemp(*args, **kw):
+            path = real_mkdtemp(*args, **kw)
+            created.append(Path(path))
+            return path
+
+        with patch.object(judge.tempfile, "mkdtemp", tracking_mkdtemp):
+            code = judge.judge_submission(
+                self.source, "python", self.cases, Limits(),
+                checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
+                **kwargs,
+            )
+        self.assertTrue(created, "judge_submission 应创建临时工作目录")
+        return code, created[0]
+
+    def _track_mkdtemp(self):
+        """返回 (patcher, 记录列表)：包住 tempfile.mkdtemp，记录创建的路径。"""
+        created: list[Path] = []
+        real = tempfile.mkdtemp
+
+        def tracking(*args, **kw):
+            path = real(*args, **kw)
+            created.append(Path(path))
+            return path
+
+        return patch.object(judge.tempfile, "mkdtemp", tracking), created
+
+    def _submit(self, **kwargs):
+        """跑一次 judge_submission，返回 (退出码, 它创建的 work_dir)。
+
+        不用 glob 扫 /tmp：那会把其他测试（或并行进程）同时创建的目录算进来，
+        导致间歇性误报。这里包住 tempfile.mkdtemp，只盯自己的那一个。
+        """
+        patcher, created = self._track_mkdtemp()
+        with patcher:
+            code = judge.judge_submission(
+                self.source, "python", self.cases, Limits(),
+                checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
+                **kwargs,
+            )
+        self.assertEqual(len(created), 1, "judge_submission 应创建一个工作目录")
+        return code, created[0]
 
     def test_chmod_failure_still_cleans_work_dir(self):
         # 模拟 root 分支：chmod 抛 OSError。目录必须仍被清理，原错误可见。
-        before = set(glob.glob("/tmp/local-judge-*"))
-        with patch.object(judge.os, "geteuid", return_value=0), \
+        patcher, created = self._track_mkdtemp()
+        with patcher, \
+                patch.object(judge.os, "geteuid", return_value=0), \
                 patch.object(judge.os, "chmod", side_effect=OSError("chmod failed")), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaises(OSError) as ctx:
-                self._submit()
+                judge.judge_submission(
+                    self.source, "python", self.cases, Limits(),
+                    checker=None, cgroup_root=self.root / "no-cgroup", isolated=False)
         self.assertIn("chmod failed", str(ctx.exception))
-        after = set(glob.glob("/tmp/local-judge-*"))
-        self.assertEqual(after, before, "chmod 失败后工作目录应被清理")
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists(), "chmod 失败后工作目录应被清理")
 
     def test_chmod_failure_with_keep_work_dir_preserves_dir(self):
         # keep_work_dir=True 的约定不变：即使是权限设置失败也保留目录。
-        before = set(glob.glob("/tmp/local-judge-*"))
-        with patch.object(judge.os, "geteuid", return_value=0), \
+        patcher, created = self._track_mkdtemp()
+        with patcher, \
+                patch.object(judge.os, "geteuid", return_value=0), \
                 patch.object(judge.os, "chmod", side_effect=OSError("chmod failed")), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaises(OSError):
-                self._submit(keep_work_dir=True)
-        after = set(glob.glob("/tmp/local-judge-*"))
-        created = after - before
-        self.assertTrue(created, "keep_work_dir=True 应保留目录")
-        for path in created:
-            shutil.rmtree(path, ignore_errors=True)
+                judge.judge_submission(
+                    self.source, "python", self.cases, Limits(),
+                    checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
+                    keep_work_dir=True)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].exists(), "keep_work_dir=True 应保留目录")
+        shutil.rmtree(created[0], ignore_errors=True)
 
     def test_normal_run_cleans_work_dir(self):
-        before = set(glob.glob("/tmp/local-judge-*"))
         with redirect_stdout(io.StringIO()):
-            exit_code = self._submit()
+            exit_code, work = self._submit()
         self.assertEqual(exit_code, 0)
-        self.assertEqual(set(glob.glob("/tmp/local-judge-*")) - before, set())
+        self.assertFalse(work.exists(), "正常结束应删掉工作目录")
 
     def test_compile_failure_cleans_work_dir(self):
         self.source.write_text("def broken(:\n")  # 真正无法编译的语法错误
-        before = set(glob.glob("/tmp/local-judge-*"))
         with redirect_stdout(io.StringIO()):
-            exit_code = self._submit()
+            exit_code, work = self._submit()
         self.assertEqual(exit_code, 2)
-        self.assertEqual(set(glob.glob("/tmp/local-judge-*")) - before, set())
+        self.assertFalse(work.exists(), "编译失败也应删掉工作目录")
 
 
 class ExecutionPathReportingTests(unittest.TestCase):
