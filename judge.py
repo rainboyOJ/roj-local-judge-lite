@@ -1007,17 +1007,21 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
                      drop_privileges: Optional[bool], inherit_env: bool,
                      executor_path: Optional[Path], cgroup_root: Optional[Path],
                      isolated: bool, expected_path: Optional[Path],
-                     checker: Optional[Path] = None) -> CaseResult:
+                     checker: Optional[Path] = None,
+                     answer_path: Optional[Path] = None) -> CaseResult:
     """测试点事务的共用核心：创建组 → 执行 → 停止后代 → 读统计 → 删组 → 判定。
 
     expected_path 为 None 时不做答案比对，内部 OK 原样返回（供
     execute_program 使用）；给出时，只有执行正常才比较答案，收口成 AC/WA。
+    answer_path 是比较答案实际读取的文件；未给出时用 output_path
+    （stdio 模式二者相同）。
 
     cgroup 文件操作仍全部在 MemoryCgroup 里，本函数不复制它们；executor 的
     启动与报告解析交给 invoke_executor()；判定交给 classify_execution()。
     取消（KeyboardInterrupt）不被吸收，向顶层传播。
     """
     limits = limits or Limits()
+    answer_abs = Path(answer_path).absolute() if answer_path else Path(output_path).absolute()
     executor = Path(executor_path or Path(__file__).with_name("executor")).absolute()
     try:
         argv, work_dir_abs, input_abs, output_abs, stderr_abs, drop = _prepare_execution(
@@ -1052,12 +1056,20 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
             result = CaseResult(verdict=verdict, message=message,
                                 report=report, memory=memory)
         # 只有执行正常时才看答案——OK 是内部中间态，在此收口成 AC/WA。
+        # 写目标（stdout/stderr）仍受只读保护；答案文件是提交写、judge 读，
+        # 不做写目标检查，只检查其类型与别名。
         if expected_path is not None and result.verdict is Verdict.OK:
             expected_abs = Path(expected_path).absolute()
-            ac = compare_output(input_abs, expected_abs, output_abs, checker)
-            result.verdict = Verdict.AC if ac else Verdict.WA
-            if not ac:
-                result.message = first_difference(expected_abs, output_abs)
+            usable, why = case_io.check_answer_file(
+                answer_abs, stdin_path=input_abs, expected_path=expected_abs)
+            if not usable:
+                result.verdict = Verdict.WA
+                result.message = why
+            else:
+                ac = compare_output(input_abs, expected_abs, answer_abs, checker)
+                result.verdict = Verdict.AC if ac else Verdict.WA
+                if not ac:
+                    result.message = first_difference(expected_abs, answer_abs)
     except KeyboardInterrupt:
         # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
         raise
@@ -1069,9 +1081,8 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
         # 所以这里退回调用方传入的原值，不引用未赋值的局部变量。
         return CaseResult(verdict=Verdict.SE, message=_describe_failure(exc),
                           output_path=str(output_path), stderr_path=str(stderr_path or ""))
-    # 返回路径与实际执行使用的绝对路径一致：调用方省略 stderr 时，
-    # 也能据此找到 executor 实际写入的 .err 文件。
-    result.output_path = str(output_abs)
+    # 返回路径：output_path 指向实际用于判题的答案文件（见 plan §5.3）。
+    result.output_path = str(answer_abs)
     result.stderr_path = str(stderr_abs)
     return result
 
@@ -1084,15 +1095,18 @@ def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
                executor_path: Optional[Path] = None,
                output_path: Optional[Path] = None,
                stderr_path: Optional[Path] = None,
-               cwd: Optional[Path] = None) -> CaseResult:
+               cwd: Optional[Path] = None,
+               answer_output_path: Optional[Path] = None) -> CaseResult:
     """一个测试点的完整事务：执行 → 收尾 → 判定 → 比较答案。
 
     返回值就是最终结果（AC/WA/TLE/MLE/RE/SE）；内部 OK 不会成为最终结果。
-    具体的事务在 _run_transaction 里，这里只决定输出路径与是否比对答案。
 
-    输出写入与标准答案必须是不同文件：同路径、软链接、硬链接都会在启动
-    executor 之前被 _check_readonly_targets 拒绝（ValueError），避免覆盖
-    题目数据后自我比较得出错误 AC。
+    output_path 是 executor 抛获 stdout 的文件；answer_output_path 是比较
+    答案实际读取的文件（file 模式下为提交生成的输出文件）。未给出时两者
+    相同，现有调用不变。
+
+    写目标与原输入/标准答案必须是不同文件：同路径、软链接、硬链接都会在
+    启动 executor 之前被 _check_readonly_targets 拒绝（ValueError）。
     """
     output_dir = Path(cwd) if cwd else work_dir
     user_output = Path(output_path) if output_path else output_dir / f"case-{index}.out"
@@ -1102,13 +1116,14 @@ def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
         stderr_path = user_output.with_suffix(user_output.suffix + ".err")
     else:
         stderr_path = output_dir / f"case-{index}.err"
+    answer_path = Path(answer_output_path) if answer_output_path else user_output
     return _run_transaction(
         run_argv, input_path, user_output, limits,
         stderr_path=stderr_path, work_dir=work_dir, cwd=cwd,
         run_uid=run_uid, run_gid=run_gid, drop_privileges=drop_privileges,
         inherit_env=inherit_env, executor_path=executor_path,
         cgroup_root=cgroup_root, isolated=isolated, expected_path=expected_path,
-        checker=checker,
+        checker=checker, answer_path=answer_path,
     )
 
 
@@ -1138,16 +1153,21 @@ def execute_program(run_argv: list[str], input_path: Path, output_path: Path,
 def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]],
                      limits: Limits, *, checker: Optional[Path],
                      cgroup_root: Path, isolated: bool,
-                     keep_work_dir: bool = False) -> int:
+                     keep_work_dir: bool = False,
+                     io_config: Optional[case_io.IOConfig] = None,
+                     drop_privileges: Optional[bool] = None,
+                     run_uid: int = 65534, run_gid: int = 65534) -> int:
     """一份提交的完整评测：管理工作目录，编译一次，逐点执行，汇总并清理。
 
     资源边界：工作目录在进入后立即创建，并在 finally 里清理（除非
     keep_work_dir），所以编译失败、执行异常、取消都经过同一个收尾。
-    单个测试点的资源生命周期在 judge_case 里；展示与汇总只读
-    CaseResult.verdict。
+    每个测试点有独立的运行目录（见 case_io.prepare_case_files）；
+    单点的进程/cgroup 生命周期在 judge_case 里。
 
     返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1，编译失败为 2。
     """
+    io_config = io_config or case_io.IOConfig()
+    drop = case_io.resolve_drop_privileges(drop_privileges, run_uid)
     work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
     try:
         # chmod 与编译、执行同在清理边界内：目录一旦建成就不会因
@@ -1166,10 +1186,30 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
         started = time.monotonic()
         verdicts: list[str] = []
         for index, (name, input_path, expected_path) in enumerate(cases, start=1):
-            result = judge_case(
-                run_argv, input_path, expected_path, limits, work_dir=work_dir,
-                index=index, checker=checker, cgroup_root=cgroup_root, isolated=isolated,
-            )
+            # 准备失败（权限、磁盘等）记为 SE，继续下一点，与现有循环策略一致。
+            try:
+                files = case_io.prepare_case_files(
+                    work_dir, index, input_path, io_config,
+                    drop=drop, run_uid=run_uid, run_gid=run_gid)
+            except OSError as exc:
+                verdicts.append("SE")
+                print(f"  #{index:<3} {name:<12} {'SE':<6}   准备测试点目录失败：{exc}")
+                continue
+            # 准备成功立即进入清理边界，中间不插入可能失败的操作。
+            try:
+                result = judge_case(
+                    run_argv, files.stdin_path, expected_path, limits,
+                    work_dir=work_dir, index=index, checker=checker,
+                    cgroup_root=cgroup_root, isolated=isolated,
+                    drop_privileges=drop, cwd=files.cwd,
+                    output_path=files.stdout_path, stderr_path=files.stderr_path,
+                    answer_output_path=files.answer_path,
+                    run_uid=run_uid, run_gid=run_gid,
+                )
+            finally:
+                # 进程/cgroup 清理失败时不删目录，保留以免丢失诊断。
+                if not keep_work_dir:
+                    shutil.rmtree(files.cwd, ignore_errors=True)
             verdicts.append(result.verdict.value)
             print(format_case_line(index, name, result))
 
@@ -1297,7 +1337,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     return judge_submission(
         source, lang, cases, limits, checker=checker,
         cgroup_root=cgroup_root, isolated=isolated,
-        keep_work_dir=args.keep_work_dir,
+        keep_work_dir=args.keep_work_dir, io_config=io_config,
     )
 
 
