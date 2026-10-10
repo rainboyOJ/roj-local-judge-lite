@@ -1015,8 +1015,12 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
 
     expected_path 为 None 时不做答案比对，内部 OK 原样返回（供
     execute_program 使用）；给出时，只有执行正常才比较答案，收口成 AC/WA。
-    answer_path 是比较答案实际读取的文件；未给出时用 output_path
-    （stdio 模式二者相同）。
+
+    output_path 与 answer_path 的区别（两种 IO 模式的全部差异就在这里）：
+    output_path 是 executor 捕获提交标准输出的文件（也是写入目标，受只读
+    保护）；answer_path 是判断答案时真正读取的文件。stdio 模式二者相同；
+    file 模式下 answer_path 是提交自己写出的输出文件（如 apple.out），
+    stdout 捕获文件仍保留供诊断，但不参与判题。
 
     cgroup 文件操作仍全部在 MemoryCgroup 里，本函数不复制它们；executor 的
     启动与报告解析交给 invoke_executor()；判定交给 classify_execution()。

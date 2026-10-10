@@ -21,9 +21,13 @@ AC / WA / TLE / MLE / RE 结论。
 - [Python 接口](#python-接口)
 - [结果与分类](#结果与分类)
 - [读代码的顺序](#读代码的顺序)
-- [local_judge.py 独立使用说明](#local_judgepy-独立使用说明)
+- [题目配置与输入输出模式](#题目配置与输入输出模式)
+  - [配置校验](#配置校验)
+  - [文件模式下“未生成输出”的规则](#文件模式下未生成输出的规则)
+  - [工作目录布局](#工作目录布局)
+- [judge.py 独立使用说明](#judgepy-独立使用说明)
   - [基本用法](#基本用法)
-  - [local_judge.py 执行逻辑](#local_judgepy-执行逻辑)
+  - [judge.py 执行逻辑](#judgepy-执行逻辑)
 - [安装脚本](#安装脚本)
 - [其他参数](#其他参数)
 - [验证](#验证)
@@ -36,8 +40,8 @@ AC / WA / TLE / MLE / RE 结论。
 git clone https://github.com/rainboyOJ/roj-local-judge-lite.git
 cd roj-local-judge-lite
 make                                            # 首次构建 C helper
-python3 local_judge.py --pid 1000 solution.cpp  # 跑 testData/1000/data 下的全部测试点
-python3 local_judge.py --list                   # 看本地有哪些题
+python3 judge.py --pid 1000 solution.cpp  # 跑 testData/1000/data 下的全部测试点
+python3 judge.py --list                   # 看本地有哪些题
 ```
 
 macOS 用户请直接看[在 macOS 上运行](#在-macos-上运行)。
@@ -73,7 +77,7 @@ roj-local-judge-lite --pid 1000 solution.cpp
 
 `--pid` 对应 `testData/<pid>/data`。隔离默认依次尝试 cgroup v2、
 `systemd-run` 委派 scope，都不可用时降级为 wall 超时加 `RLIMIT_CPU` 并明确提示。
-完整参数见 [local_judge.py 独立使用说明](#local_judgepy-独立使用说明)。
+完整参数见 [judge.py 独立使用说明](#judgepy-独立使用说明)。
 
 ### 当作执行器或库
 
@@ -169,14 +173,14 @@ python3 runner.py --cgroup-root /sys/fs/cgroup/your-delegated-parent \
 起一个临时委派 scope 后重跑自己（需要 `systemd-run` 和 `XDG_RUNTIME_DIR`）：
 
 ```bash
-python3 local_judge.py --pid 1000 solution.cpp
+python3 judge.py --pid 1000 solution.cpp
 # 执行 cgroup 隔离，root=/sys/fs/cgroup/user.slice/.../run-XXXX.scope
 ```
 
 **2. root：也不用准备目录。** root 没有自己的用户管理器，工具会用系统管理器委派：
 
 ```bash
-sudo python3 local_judge.py --pid 1000 solution.cpp
+sudo python3 judge.py --pid 1000 solution.cpp
 ```
 
 不要因为想拿到隔离而手动保留 `XDG_RUNTIME_DIR` 去跑 `systemd-run --user`：`sudo`
@@ -457,25 +461,91 @@ helper 的 stdout 专门传 JSON 资源报告，用户 stdout 写入输出文件
 cgroup 需要外部隔离。CPU 仍由直接子进程的 `wait4`/`RLIMIT_CPU` 管理，不使用 cgroup CPU
 配额，也不把它当成任意进程树的 CPU 总额。
 
-## local_judge.py 独立使用说明
+## 题目配置与输入输出模式
 
-本目录提供独立的 `runner.py` 底层执行器和面向开发者的单机测试脚本 `local_judge.py`，不依赖 judge_server。
+题目目录下的 `config.json` 声明标题、限制和输入输出模式：
+
+```json
+{
+  "title": "苹果",
+  "time": 1000,
+  "memory": 128,
+  "io": { "mode": "file", "input_file": "apple.in", "output_file": "apple.out" }
+}
+```
+
+省略 `io`（或写 `{"io": {"mode": "stdio"}}`）就是默认的标准流模式。
+
+| 模式 | 提交怎么读写 | judge 拿什么比对答案 |
+|---|---|---|
+| `stdio`（默认） | 标准输入 / 标准输出 | executor 捕获的 stdout |
+| `file` | 自己 `freopen("apple.in", "r", stdin)`、`freopen("apple.out", "w", stdout)`，或 Python 直接 `open()` | 提交生成的 `apple.out` |
+
+`file` 模式下每个测试点在 `work/case-N/` 里独立运行，`apple.in` 是当前测试
+输入的**副本**（提交改动它不会影响原题目数据），判题只认 `apple.out`；提交
+写到标准输出的内容不会被当成答案。
+
+### 配置校验
+
+配置错误在编译前报错并返回 `2`：`mode` 只能是 `stdio`/`file`；`file` 模式必须
+同时给出两个文件名；文件名不能含路径分隔符、不能是 `.`/`..`、不能相同、不能
+以 `_judge.` 开头（该前缀留给评测器自己的文件）。`stdio` 模式下同时写了文件名
+只会提示并忽略，便于随时切换到 `file`。
+
+### 文件模式下“未生成输出”的规则
+
+先按原有规则判执行是否正常，再看答案文件——**超时、超内存、非零退出、基础设施
+故障都不会被“输出不存在”盖过**：
+
+| 情况 | 结果 |
+|---|---|
+| 执行已判为 TLE / MLE / RE / SE | 保留原判定，不看答案文件 |
+| 执行正常，但 `apple.out` 不存在 | WA，说明未生成输出文件 |
+| `apple.out` 是目录或软链接 | WA，答案必须是普通文件 |
+| `apple.out` 与只读文件（原输入 / 标准答案）是硬链接别名 | WA，拒绝自我比较 |
+| 文件存在但读取失败 | SE |
+| 文件为空 | 正常比较；标准答案也为空时可以 AC |
+
+`RLIMIT_FSIZE`（`--output-limit`）同样限制提交写出的普通文件大小。
+
+### 工作目录布局
+
+`--keep-work-dir` 会保留整个临时目录，两种模式都一样：
+
+```text
+work/
+├── solution            # C++ 编译产物，只编译一次
+├── case-1/
+│   ├── apple.in        # file 模式：当前测试输入的副本
+│   ├── apple.out       # file 模式：提交生成的答案
+│   ├── _judge.stdout   # executor 捕获的标准输出
+│   └── _judge.stderr   # executor 捕获的标准错误
+└── case-2/ ...
+```
+
+`case-*` 目录与 `case-*` cgroup 是两种资源：前者存文件，后者存资源控制接口。
+若某个测试点收尾失败，该点目录会保留并打印路径（外层工作目录也不整棵删除），
+以免诊断信息被一并清掉。
+
+## judge.py 独立使用说明
+
+`judge.py` 是面向用户的单机评测入口，底层由独立的 C `executor` 执行，不依赖 judge_server。
 它可以自动寻找测试数据目录下的用例，对单份代码进行编译、运行测试，并比对答案（提供最终的 AC/WA/TLE/MLE 等结论）。
 
 ### 基本用法
 
 ```bash
 # 默认找当前目录下的 testData/（仓库里就是自带的那两道示例题）
-python3 local_judge.py --pid 1000 solution.cpp
+python3 judge.py --pid 1000 solution.cpp
 
 # 指定测试数据目录
-python3 local_judge.py --pid 1000 solution.py --testdata /path/to/testData
+python3 judge.py --pid 1000 solution.py --testdata /path/to/testData
 
 # 修改时间限制(1000ms)和空间限制(256MB)
-python3 local_judge.py --pid 1000 solution.cpp --time 1000 --memory 256
+python3 judge.py --pid 1000 solution.cpp --time 1000 --memory 256
 
 # 查看本地有哪些题目、各有多少测试点
-python3 local_judge.py --list
+python3 judge.py --list
 ```
 
 常用参数：
@@ -491,14 +561,14 @@ python3 local_judge.py --list
 | `--no-cgroup` | 跳过 cgroup，直接走降级模式 |
 | `--keep-work-dir` | 保留临时工作目录，便于查看输出和编译日志 |
 
-### local_judge.py 执行逻辑
+### judge.py 执行逻辑
 
 1. **编译 (Compile)**：C++ 用 `g++ -std=c++17 -O2 -DONLINE_JUDGE`（与 judge_server 同一组参数），Python 用 `py_compile` 做语法检查，把解释型语言统一映射到“编译阶段”。
-2. **执行 (Run)**：对 `data` 目录里每个配对的 `.in` 调用底层 `runner.py`。隔离依次尝试 cgroup v2、`systemd-run` 委派 scope，都不可用时降级为 wall 超时加 `RLIMIT_CPU`，并明确提示 MLE 无法判定。
+2. **执行 (Run)**：对 `data` 目录里每个配对的 `.in` 调用 C `executor`（每个测试点一个独立目录）。隔离依次尝试 cgroup v2、`systemd-run` 委派 scope，都不可用时降级为 wall 超时加 `RLIMIT_CPU`，并明确提示 MLE 无法判定。
 3. **比对 (Compare)**：把用户输出与同名的标准 `.out` 比较。默认优先用 `/judge/checker/fcmp2`（若已部署），否则按行比较，忽略行尾空白和末尾空行。
 4. **汇总 (Summary)**：终端打印每个测试点的耗时、内存和状态（AC / WA / TLE / MLE / RE）。
 
-隔离与降级都调用 `run_case()`，不再维护 Python `preexec_fn` 执行路径。
+隔离与降级都走同一条 `judge_case()` 事务，不维护第二套 Python 执行路径。
 统一后降级模式也会在正常退出和 Ctrl+C 时清理进程组，应用相同的资源限额；
 root 运行时同样默认降权到 nobody，需保证源文件、可执行文件和工作目录可访问。
 
