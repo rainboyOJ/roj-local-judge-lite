@@ -799,6 +799,116 @@ class FileModeEndToEndTests(unittest.TestCase):
         self.assertIn("通过 2/2", output)
 
 
+class CaseDirectoryLifecycleTests(unittest.TestCase):
+    """第四步：测试点目录的准备、回滚与清理边界。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="casedir-life-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "in"
+        self.input.write_text("1\n")
+        self.input.chmod(0o644)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.work.chmod(0o755)
+
+    def test_prepare_creates_independent_directories(self):
+        cfg = case_io.IOConfig("file", "a.in", "a.out")
+        f1 = case_io.prepare_case_files(self.work, 1, self.input, cfg,
+                                        drop=False, run_uid=65534, run_gid=65534)
+        f2 = case_io.prepare_case_files(self.work, 2, self.input, cfg,
+                                        drop=False, run_uid=65534, run_gid=65534)
+        self.assertNotEqual(f1.cwd, f2.cwd)
+        self.assertTrue((f1.cwd / "a.in").is_file())
+        # 输出文件不提前创建。
+        self.assertFalse((f1.cwd / "a.out").exists())
+
+    def test_prepare_failure_rolls_back_directory(self):
+        missing = self.root / "missing.in"
+        cfg = case_io.IOConfig("file", "a.in", "a.out")
+        with self.assertRaises(OSError):
+            case_io.prepare_case_files(self.work, 1, missing, cfg,
+                                       drop=False, run_uid=65534, run_gid=65534)
+        self.assertFalse((self.work / "case-1").exists(), "准备失败应回滚目录")
+
+    def test_stdio_answer_path_is_captured_stdout(self):
+        f = case_io.prepare_case_files(self.work, 1, self.input, case_io.IOConfig(),
+                                       drop=False, run_uid=65534, run_gid=65534)
+        self.assertEqual(f.answer_path, f.stdout_path)
+        self.assertEqual(f.stdin_path, self.input.resolve())
+
+    def test_file_answer_path_is_the_output_file(self):
+        cfg = case_io.IOConfig("file", "a.in", "a.out")
+        f = case_io.prepare_case_files(self.work, 1, self.input, cfg,
+                                       drop=False, run_uid=65534, run_gid=65534)
+        self.assertEqual(f.answer_path, f.cwd / "a.out")
+        self.assertNotEqual(f.answer_path, f.stdout_path)
+
+    def test_cleanup_failed_flag_retains_directory(self):
+        # 模拟执行层报告收尾失败：目录必须被保留并有诊断。
+        cfg = case_io.IOConfig("file", "a.in", "a.out")
+        fake_dir = self.work / "case-1"
+        fake_dir.mkdir()
+        (fake_dir / "a.out").write_text("7\n")
+
+        def fake_judge_case(*args, **kwargs):
+            return judge.CaseResult(verdict=Verdict.SE, message="cleanup failed",
+                                    cleanup_failed=True)
+        src = self.root / "s.py"
+        src.write_text("pass\n")
+        err = io.StringIO()
+        with patch.object(judge, "judge_case", fake_judge_case), \
+                patch("case_io.prepare_case_files", return_value=case_io.CaseFiles(
+                    cwd=fake_dir, stdin_path=self.input,
+                    stdout_path=fake_dir / "_judge.stdout",
+                    stderr_path=fake_dir / "_judge.stderr",
+                    answer_path=fake_dir / "a.out")), \
+                redirect_stderr(err), redirect_stdout(io.StringIO()):
+            judge.judge_submission(src, "python", [("p1", self.input, self.input)],
+                                   Limits(), checker=None, cgroup_root=self.root / "no",
+                                   isolated=False, io_config=cfg)
+        self.assertTrue(fake_dir.exists(), "收尾失败时应保留目录")
+        self.assertIn("保留目录", err.getvalue())
+
+
+class FileModeDropPrivilegesTests(unittest.TestCase):
+    """第四步：root 降权后仍能打开输入文件、创建输出文件（需 root）。"""
+
+    @unittest.skipUnless(os.geteuid() == 0, "降权路径需要 root")
+    def test_dropped_submission_can_open_input_and_create_output(self):
+        with tempfile.TemporaryDirectory(prefix="filedrop-") as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            work = root / "work"
+            work.mkdir()
+            work.chmod(0o755)
+            source_in = root / "in"
+            source_in.write_text("3 4\n")
+            source_in.chmod(0o644)
+            cfg = case_io.IOConfig("file", "apple.in", "apple.out")
+            files = case_io.prepare_case_files(
+                work, 1, source_in, cfg, drop=True, run_uid=65534, run_gid=65534)
+            # 目录与输入副本已按执行身份布置。
+            self.assertEqual(files.cwd.stat().st_uid, 65534)
+            self.assertEqual((files.cwd / "apple.in").stat().st_uid, 65534)
+            # 标准答案必须是独立文件（不能与输出同名，否则是自我比较）。
+            expected = root / "expected"
+            expected.write_text("7\n")
+            expected.chmod(0o644)
+            result = judge.judge_case(
+                [sys.executable, "-c",
+                 "open('apple.in'); open('apple.out','w').write('7\\n')"],
+                files.stdin_path, expected, Limits(),
+                work_dir=work, index=1, checker=None,
+                cgroup_root=root / "no-cgroup", isolated=False,
+                drop_privileges=True, cwd=files.cwd,
+                output_path=files.stdout_path, stderr_path=files.stderr_path,
+                answer_output_path=files.answer_path,
+            )
+            self.assertIs(result.verdict, Verdict.AC, result.message)
+
+
 class DelegationModeTests(unittest.TestCase):
     """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
 

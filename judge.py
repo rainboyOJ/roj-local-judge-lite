@@ -617,6 +617,8 @@ class CaseResult:
 
     output_path: str = ""
     stderr_path: str = ""
+    cleanup_failed: bool = False
+    """进程/cgroup 收尾是否失败；失败时调用方应保留测试点目录供排查。"""
 
     # 展示用便捷属性：从 report/memory 派生，避免调用方到处判空。
     @property
@@ -1080,7 +1082,8 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
         # 配置准备可能尚未算出绝对路径（_prepare_execution 抛错），
         # 所以这里退回调用方传入的原值，不引用未赋值的局部变量。
         return CaseResult(verdict=Verdict.SE, message=_describe_failure(exc),
-                          output_path=str(output_path), stderr_path=str(stderr_path or ""))
+                          output_path=str(output_path), stderr_path=str(stderr_path or ""),
+                          cleanup_failed=bool(getattr(exc, "cleanup_notes", None)))
     # 返回路径：output_path 指向实际用于判题的答案文件（见 plan §5.3）。
     result.output_path = str(answer_abs)
     result.stderr_path = str(stderr_abs)
@@ -1169,6 +1172,7 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
     io_config = io_config or case_io.IOConfig()
     drop = case_io.resolve_drop_privileges(drop_privileges, run_uid)
     work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
+    retained_case_dirs: list[Path] = []
     try:
         # chmod 与编译、执行同在清理边界内：目录一旦建成就不会因
         # 后续任何失败（包括权限设置失败）而遗留。
@@ -1196,6 +1200,8 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
                 print(f"  #{index:<3} {name:<12} {'SE':<6}   准备测试点目录失败：{exc}")
                 continue
             # 准备成功立即进入清理边界，中间不插入可能失败的操作。
+            # result 用 sentinel 初始化：judge_case 抛异常时仍能正确处理目录。
+            result = None
             try:
                 result = judge_case(
                     run_argv, files.stdin_path, expected_path, limits,
@@ -1206,10 +1212,22 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
                     answer_output_path=files.answer_path,
                     run_uid=run_uid, run_gid=run_gid,
                 )
-            finally:
-                # 进程/cgroup 清理失败时不删目录，保留以免丢失诊断。
+            except KeyboardInterrupt:
+                # 取消：进程/cgroup 已由 judge_case 收尾（含诊断），
+                # 目录按 keep 约定处理，然后原样向上传播。
                 if not keep_work_dir:
                     shutil.rmtree(files.cwd, ignore_errors=True)
+                raise
+            finally:
+                # 进程/cgroup 清理失败时保留目录，否则诊断会丢失。
+                # result 为 None（异常路径）时已在上面处理。
+                if result is not None:
+                    if result.cleanup_failed:
+                        retained_case_dirs.append(files.cwd)
+                        print(f"  ⚠ 测试点 {index} 收尾失败，保留目录：{files.cwd}",
+                              file=sys.stderr)
+                    elif not keep_work_dir:
+                        shutil.rmtree(files.cwd, ignore_errors=True)
             verdicts.append(result.verdict.value)
             print(format_case_line(index, name, result))
 
@@ -1225,8 +1243,12 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
         return 0 if overall == "AC" else 1
     finally:
         # 与 judge_case 的进程/cgroup 清理各管一类资源。
-        if not keep_work_dir:
+        # 有测试点因收尾失败而保留目录时，外层也不整棵删，
+        # 否则刚保留的诊断会被一并抹掉。
+        if not keep_work_dir and not retained_case_dirs:
             shutil.rmtree(work_dir, ignore_errors=True)
+        elif not keep_work_dir:
+            print(f"  ⚠ 因收尾失败保留工作目录：{work_dir}", file=sys.stderr)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
