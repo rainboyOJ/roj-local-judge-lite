@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import judge
-from judge import (ExecutionReport, ExecutorError, Limits, Verdict,
+from judge import (ExecutionReport, ExecutorError, Limits, Verdict, execute_program,
                    invoke_executor, judge_case)
 
 
@@ -31,28 +31,26 @@ class ExecutionTestsMixin:
         self.input = self.root / "input"
         self.output = self.root / "output"
         self.input.write_bytes(b"3 4\n")
-        # 执行层测试只关心执行事实（CPU/内存/信号/回收），不比较答案；
-        # 用一个不被用于比对的空期望文件，执行正常即判 AC。
+        # 标准答案与输出必须是不同文件（R1），不能自我比较。
+        # 执行层测试不关心答案对错，直接用 invoke_executor 拿原始报告；
+        # 需要判定的用例自带明确的标准答案。
         self.expected = self.root / "expected"
         self.expected.write_text("")
 
-    # 兼容混入中历史调用点的签名：argv, input, output, limits, **kwargs。
-    # 输出路径传给 judge_case 以便测试直接读回。
+    # 历史调用点签名：argv, input, output, limits, **kwargs。
+    # 执行层测试只验证执行事实，所以直接调 execute_program，
+    # 返回原始事实结果，不经答案比对。
     def run_case(self, argv, input_path=None, output_path=None, limits=None, **kwargs):
         kwargs.pop("use_cgroup", None)
-        # 历史名 helper_path 对应现在的 executor_path。
         if "helper_path" in kwargs:
             kwargs["executor_path"] = kwargs.pop("helper_path")
-        # cgroup_root 未显式给出时：有 cgroup 模式从 ROJ_JUDGE_CGROUP_ROOT
-        # 读取（与真实评测一致）；无 cgroup 模式给一个不存在的路径，
-        # 但 isolated=False 下它不会被访问。
         if "cgroup_root" not in kwargs:
-            kwargs["cgroup_root"] = (None if self.use_cgroup
-                                     else self.root / "missing-cgroup")
-        return judge_case(
+            kwargs["cgroup_root"] = None if self.use_cgroup else self.root / "missing-cgroup"
+        kwargs.setdefault("drop_privileges", False)
+        return execute_program(
             argv, input_path or self.input, output_path or self.output,
-            limits or Limits(), work_dir=self.root, index=1, checker=None,
-            isolated=self.use_cgroup, output_path=output_path or self.output, **kwargs,
+            limits or Limits(), work_dir=self.root,
+            isolated=self.use_cgroup, **kwargs,
         )
 
     def execute(self, argv, **kwargs):
@@ -89,7 +87,7 @@ class ExecutionTestsMixin:
             self.input, self.output, Limits(),
             stderr_path=self.root / "error", drop_privileges=False,
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(self.output.read_bytes(), self.input.read_bytes())
         self.assertEqual((self.root / "error").read_text(), "literal $(not-a-shell)")
 
@@ -98,7 +96,7 @@ class ExecutionTestsMixin:
         (self.root / "solution").chmod(0o755)
         result = self.run_case(["./solution"], self.input, self.output,
                                cwd=self.root, drop_privileges=False)
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
 
     def test_relative_path_entry_uses_submission_cwd(self):
         # PATH 查找已交给 execvp；相对 PATH 项仍应从提交的 cwd 开始查找。
@@ -109,7 +107,7 @@ class ExecutionTestsMixin:
         with patch.dict(os.environ, {"PATH": "bin"}):
             result = self.run_case(["solution"], self.input, self.output,
                                    cwd=self.root, drop_privileges=False)
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
 
     def test_executor_report_keeps_program_output_separate(self):
         # 原 runner CLI 的“报告与用户输出分离”测试，改为直接验证协议：
@@ -117,7 +115,7 @@ class ExecutionTestsMixin:
         # 提交的 stdout 全部落到输出文件。
         payload = "[print('{\"verdict\": \"AC\"}') for _ in range(50)]"
         result = self.run_python(payload)
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(len(self.output.read_text().splitlines()), 50)
 
     def test_wall_timeout(self):
@@ -145,7 +143,7 @@ class ExecutionTestsMixin:
             "resource.RLIMIT_CORE)]))",
             Limits(stack_mb=32, output_limit_mb=1, nproc=4096),
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(json.loads(self.output.read_text()), [
             [32 * 1024 * 1024] * 2, [1024 * 1024] * 2, [4096] * 2, [0, 0],
         ])
@@ -228,14 +226,14 @@ class ExecutionTestsMixin:
             f"if p: open({str(pidfile)!r}, 'w').write(str(p))\n"
             "else: time.sleep(10)\n",
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assert_stopped(int(pidfile.read_text()))
 
     def test_interrupt_cleans_up_submission_group(self):
-        # 取消路径：向评测进程发 SIGINT，judge_case 会把 KeyboardInterrupt
-        # 抛出并先让 executor 杀掉提交进程组（包括 fork 出的后代）。
-        # 用内联 harness 调用 judge.judge_case，保留同一条真实信号
-        # 路径与进程清理断言。
+        # 取消路径：向评测进程发 SIGINT，execute_program 会把
+        # KeyboardInterrupt 抛出并先让 executor 杀掉提交进程组（包括
+        # fork 出的后代）。用内联 harness 保留同一条真实信号路径与进程
+        # 清理断言。
         pidfile = self.root / "pids"
         source = (
             "import os, time\np = os.fork()\n"
@@ -246,12 +244,11 @@ class ExecutionTestsMixin:
             "import sys, os; sys.path.insert(0, %r); import judge\n"
             "from pathlib import Path\n"
             "root = os.environ.get('ROJ_JUDGE_CGROUP_ROOT') or (Path(sys.argv[5]) / 'missing')\n"
-            "judge.judge_case([sys.executable, '-c', sys.argv[4]], Path(sys.argv[1]),\n"
-            "                Path(sys.argv[2]), judge.Limits(time_ms=0),\n"
-            "                work_dir=Path(sys.argv[5]), index=1, checker=None,\n"
-            "                cgroup_root=Path(root),\n"
-            "                isolated=sys.argv[3] == '1', drop_privileges=False,\n"
-            "                output_path=Path(sys.argv[2]))\n"
+            "judge.execute_program([sys.executable, '-c', sys.argv[4]], Path(sys.argv[1]),\n"
+            "                      Path(sys.argv[2]), judge.Limits(time_ms=0),\n"
+            "                      work_dir=Path(sys.argv[5]),\n"
+            "                      cgroup_root=Path(root),\n"
+            "                      isolated=sys.argv[3] == '1', drop_privileges=False)\n"
         ) % str(Path(__file__).resolve().parent)
         process = subprocess.Popen([
             sys.executable, "-c", harness,
@@ -294,7 +291,7 @@ class ExecutionTestsMixin:
             [sys.executable, "-c", "import os; print(os.getuid(), os.getgid(), os.getgroups())"],
             self.input, self.output, Limits(), cwd=self.root,
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertEqual(self.output.read_text().strip(), "65534 65534 []")
 
 
@@ -414,7 +411,7 @@ class NoCgroupRunnerTests(ExecutionTestsMixin, unittest.TestCase):
             "a = bytearray(8 * 1024 * 1024)", Limits(memory_kb=1),
             cgroup_root=self.root / "missing-cgroup",
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertGreater(result.rss_kb, 1024)
         # 无 cgroup 时内存统计未测量，用 None 表达；不能用 0 冒充“真的用量 0”。
         self.assertIsNone(result.memory)
@@ -453,7 +450,7 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
         # 如果误用 executor 自己或原 Python fork 子进程的 rusage，这里将超过 96MiB。
         for _ in range(3):
             result = self.run_python(source, limits)
-            self.assertEqual(result.verdict, Verdict.AC, result.message)
+            self.assertEqual(result.verdict, Verdict.OK, result.message)
             self.assertGreater(result.memory_kb, 4 * 1024)
             self.assertLess(result.memory_kb, 32 * 1024)
             self.assertLess(abs(result.memory_kb - baseline.memory_kb), 8 * 1024)
@@ -488,7 +485,7 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
             f"if p:\n open({str(pidfile)!r}, 'w').write(str(p))\n time.sleep(0.1)\n"
             "else:\n os.setsid()\n time.sleep(10)\n",
         )
-        self.assertEqual(result.verdict, Verdict.AC, result.message)
+        self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assert_stopped(int(pidfile.read_text()))
 
     def test_memory_includes_simultaneous_descendants(self):

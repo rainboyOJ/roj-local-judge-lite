@@ -809,14 +809,39 @@ def classify_execution(report: ExecutionReport, memory: Optional[MemoryResult],
 
 
 # ── step 03 · 固定文件路径（第 04 章）────────────────────────────────────────
+def _same_file(a: Path, b: Path) -> bool:
+    """两个路径是否指向同一个文件：字符串相同、符号链接、硬链接都算。"""
+    if a.resolve() == b.resolve():
+        return True
+    # samefile 需要两边都存在；不存在时已由上面的 resolve 比较覆盖。
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _check_stream_paths(*paths: Path) -> None:
     """防止 O_TRUNC 截断输入或让两个输出互相覆盖；也检查符号链接和硬链接。"""
     for i, path in enumerate(paths):
         for other in paths[:i]:
-            same_name = path.resolve() == other.resolve()
-            same_file = path.exists() and other.exists() and os.path.samefile(path, other)
-            if same_name or same_file:
+            if _same_file(path, other):
                 raise ValueError("stdin、stdout、stderr 必须使用不同的文件")
+
+
+def _check_readonly_targets(expected_path: Path, *write_paths: Path) -> None:
+    """拒绝把写目标指向只读输入（题目标准答案）。
+
+    executor 会用 O_TRUNC 打开 stdout/stderr，写目标一旦与标准答案同文件，
+    就会先抹掉题目数据、再拿被覆盖的文件自我比较——错误答案也会得到 AC。
+    这里在启动任何进程前拦截。符号链接与硬链接别名一律算冲突。
+    两个只读输入共享路径是允许的：本函数只看“写目标 vs 只读输入”。
+    """
+    if expected_path is None:
+        return
+    for target in write_paths:
+        if _same_file(target, expected_path):
+            raise ValueError(
+                f"输出目标不能与题目标准答案指向同一个文件：{target}")
 
 
 def _describe_failure(exc: BaseException) -> str:
@@ -835,8 +860,13 @@ def _describe_failure(exc: BaseException) -> str:
 def _prepare_execution(argv: list[str], input_path: Path, output_path: Path,
                        limits: Limits, *, stderr_path: Optional[Path], cwd: Optional[Path],
                        run_uid: int, run_gid: int, drop_privileges: Optional[bool],
-                       executor_path: Optional[Path]) -> tuple[list[str], Path, Path, Path, Path, bool]:
-    """参数校验与路径固定；返回 (argv, 工作目录, 输入, 输出, stderr, 是否降权)。"""
+                       executor_path: Optional[Path],
+                       expected_path: Optional[Path] = None) -> tuple[list[str], Path, Path, Path, Path, bool]:
+    """参数校验与路径固定；返回 (argv, 工作目录, 输入, 输出, stderr, 是否降权)。
+
+    校验顺序在启动任何进程之前：先拒绝标准流互相冲突，再拒绝写目标
+    指向题目标准答案。两者都抛 ValueError，不会截断任何文件。
+    """
     if not argv:
         raise ValueError("argv 不能为空")
     limits.validate()
@@ -848,6 +878,9 @@ def _prepare_execution(argv: list[str], input_path: Path, output_path: Path,
     output_path = Path(output_path).absolute()
     stderr_path = Path(stderr_path or str(output_path) + ".err").absolute()
     _check_stream_paths(input_path, output_path, stderr_path)
+    if expected_path is not None:
+        # 只读输入（标准答案）不能被 stdout/stderr 的写目标覆盖。
+        _check_readonly_targets(Path(expected_path).absolute(), output_path, stderr_path)
     work_dir = Path(cwd or Path.cwd()).absolute()
     if drop_privileges is None:
         drop_privileges = os.geteuid() == 0
@@ -953,46 +986,30 @@ def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
     return path, str(path)
 
 
-def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
-               limits: Limits, *, work_dir: Path, index: int, checker: Optional[Path],
-               cgroup_root: Path, isolated: bool,
-               run_uid: int = 65534, run_gid: int = 65534,
-               drop_privileges: Optional[bool] = None, inherit_env: bool = False,
-               executor_path: Optional[Path] = None,
-               output_path: Optional[Path] = None,
-               stderr_path: Optional[Path] = None,
-               cwd: Optional[Path] = None) -> CaseResult:
-    """一个测试点的完整事务：创建组 → 执行 → 停止后代 → 读统计 → 删组
-    → 判定 → 比较答案。返回值就是最终结果（AC/WA/TLE/MLE/RE/SE）。
+def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
+                     limits: Limits, *, work_dir: Path, stderr_path: Optional[Path],
+                     cwd: Optional[Path], run_uid: int, run_gid: int,
+                     drop_privileges: Optional[bool], inherit_env: bool,
+                     executor_path: Optional[Path], cgroup_root: Optional[Path],
+                     isolated: bool, expected_path: Optional[Path],
+                     checker: Optional[Path] = None) -> CaseResult:
+    """测试点事务的共用核心：创建组 → 执行 → 停止后代 → 读统计 → 删组 → 判定。
 
-    这里能看到完整的资源生命周期：`with MemoryCgroup(...)` 包住创建与清理
-    （无 cgroup 时用空上下文），executor 的启动与报告解析交给
-    invoke_executor()，限制换算交给 make_protection_limits()，判定交给
-    classify_execution()。cgroup 文件操作仍全部在 MemoryCgroup 里，
-    本函数不复制它们。
+    expected_path 为 None 时不做答案比对，内部 OK 原样返回（供
+    execute_program 使用）；给出时，只有执行正常才比较答案，收口成 AC/WA。
 
-    只有执行正常（内部 OK）才比较答案，得到 AC/WA；内部 OK 和
-    SYSTEM_ERROR 都不会作为最终结果出现。取消（KeyboardInterrupt）
-    不被吸收，向顶层传播。
-
-    output_path 省略时用 work_dir/case-{index}.out；调用方可指定以自管输出。
+    cgroup 文件操作仍全部在 MemoryCgroup 里，本函数不复制它们；executor 的
+    启动与报告解析交给 invoke_executor()；判定交给 classify_execution()。
+    取消（KeyboardInterrupt）不被吸收，向顶层传播。
     """
-    output_dir = Path(cwd) if cwd else work_dir
-    user_output = Path(output_path) if output_path else output_dir / f"case-{index}.out"
-    if stderr_path is not None:
-        stderr_path = Path(stderr_path)
-    elif output_path:
-        stderr_path = user_output.with_suffix(user_output.suffix + ".err")
-    else:
-        stderr_path = output_dir / f"case-{index}.err"
     limits = limits or Limits()
     executor = Path(executor_path or Path(__file__).with_name("executor")).absolute()
-
     try:
         argv, work_dir_abs, input_abs, output_abs, stderr_abs, drop = _prepare_execution(
-            run_argv, input_path, user_output, limits, stderr_path=stderr_path,
+            run_argv, input_path, output_path, limits, stderr_path=stderr_path,
             cwd=cwd or work_dir, run_uid=run_uid, run_gid=run_gid,
             drop_privileges=drop_privileges, executor_path=executor,
+            expected_path=expected_path,
         )
         protection = make_protection_limits(limits)
         if not executor.is_file() or not os.access(executor, os.X_OK):
@@ -1020,26 +1037,83 @@ def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
             result = CaseResult(verdict=verdict, message=message,
                                 report=report, memory=memory)
         # 只有执行正常时才看答案——OK 是内部中间态，在此收口成 AC/WA。
-        if result.verdict is Verdict.OK:
-            ac = compare_output(input_abs, Path(expected_path).absolute(),
-                                output_abs, checker)
+        if expected_path is not None and result.verdict is Verdict.OK:
+            expected_abs = Path(expected_path).absolute()
+            ac = compare_output(input_abs, expected_abs, output_abs, checker)
             result.verdict = Verdict.AC if ac else Verdict.WA
             if not ac:
-                result.message = first_difference(Path(expected_path).absolute(), output_abs)
+                result.message = first_difference(expected_abs, output_abs)
     except KeyboardInterrupt:
         # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
-        # 清理失败已作为诊断挂在异常上（见 MemoryCgroup.__exit__）。
         raise
     except (OSError, ExecutorError) as exc:
         # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
         # ValueError（配置/路径错误）不在此处捕获：那是调用方的编程错误，
         # 应在启动任何进程之前抛出，而不是变成一个测试点的 SE。
         return CaseResult(verdict=Verdict.SE, message=_describe_failure(exc),
-                          output_path=str(user_output), stderr_path=str(stderr_path))
-
-    result.output_path = str(user_output)
-    result.stderr_path = str(stderr_path)
+                          output_path=str(output_path), stderr_path=str(stderr_path or ""))
+    result.output_path = str(output_path)
+    result.stderr_path = str(stderr_path or "")
     return result
+
+
+def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
+               limits: Limits, *, work_dir: Path, index: int, checker: Optional[Path],
+               cgroup_root: Path, isolated: bool,
+               run_uid: int = 65534, run_gid: int = 65534,
+               drop_privileges: Optional[bool] = None, inherit_env: bool = False,
+               executor_path: Optional[Path] = None,
+               output_path: Optional[Path] = None,
+               stderr_path: Optional[Path] = None,
+               cwd: Optional[Path] = None) -> CaseResult:
+    """一个测试点的完整事务：执行 → 收尾 → 判定 → 比较答案。
+
+    返回值就是最终结果（AC/WA/TLE/MLE/RE/SE）；内部 OK 不会成为最终结果。
+    具体的事务在 _run_transaction 里，这里只决定输出路径与是否比对答案。
+
+    输出写入与标准答案必须是不同文件：同路径、软链接、硬链接都会在启动
+    executor 之前被 _check_readonly_targets 拒绝（ValueError），避免覆盖
+    题目数据后自我比较得出错误 AC。
+    """
+    output_dir = Path(cwd) if cwd else work_dir
+    user_output = Path(output_path) if output_path else output_dir / f"case-{index}.out"
+    if stderr_path is not None:
+        stderr_path = Path(stderr_path)
+    elif output_path:
+        stderr_path = user_output.with_suffix(user_output.suffix + ".err")
+    else:
+        stderr_path = output_dir / f"case-{index}.err"
+    return _run_transaction(
+        run_argv, input_path, user_output, limits,
+        stderr_path=stderr_path, work_dir=work_dir, cwd=cwd,
+        run_uid=run_uid, run_gid=run_gid, drop_privileges=drop_privileges,
+        inherit_env=inherit_env, executor_path=executor_path,
+        cgroup_root=cgroup_root, isolated=isolated, expected_path=expected_path,
+        checker=checker,
+    )
+
+
+def execute_program(run_argv: list[str], input_path: Path, output_path: Path,
+                    limits: Optional[Limits] = None, *, work_dir: Path,
+                    stderr_path: Optional[Path] = None, cwd: Optional[Path] = None,
+                    run_uid: int = 65534, run_gid: int = 65534,
+                    drop_privileges: Optional[bool] = None, inherit_env: bool = False,
+                    executor_path: Optional[Path] = None,
+                    cgroup_root: Optional[Path] = None, isolated: bool = True) -> CaseResult:
+    """只执行一个程序并返回执行事实，不比较答案。
+
+    与 judge_case 共用同一份 _run_transaction()（cgroup 创建 → 执行 → 停止
+    → 读统计 → 删除），区别只是不做答案比对：内部 OK 保持为 OK。供想自己
+    做判定的调用方和执行层测试使用，避免为了拿到事实而伪造标准答案。
+    """
+    limits = limits or Limits()
+    return _run_transaction(
+        run_argv, input_path, Path(output_path), limits,
+        stderr_path=stderr_path, work_dir=work_dir, cwd=cwd,
+        run_uid=run_uid, run_gid=run_gid, drop_privileges=drop_privileges,
+        inherit_env=inherit_env, executor_path=executor_path,
+        cgroup_root=cgroup_root, isolated=isolated, expected_path=None,
+    )
 
 
 def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]],

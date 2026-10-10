@@ -370,6 +370,69 @@ class JudgeCaseResultTests(unittest.TestCase):
         self.assertIs(result.verdict, Verdict.RE)
 
 
+class ExpectedOutputProtectionTests(unittest.TestCase):
+    """R1：写入目标不得与题目标准答案冲突（不能覆盖题目数据后自我比较）。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="expected-protect-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "in"
+        self.input.write_text("1 2\n")
+        self.expected = self.root / "expected"
+        self.expected.write_text("3\n")
+
+    def _case(self, **kwargs):
+        return judge_case(
+            [sys.executable, "-c", "print(0)"], self.input, self.expected,
+            Limits(), work_dir=self.root, index=1, checker=None,
+            cgroup_root=self.root / "no-cgroup", isolated=False,
+            drop_privileges=False, **kwargs,
+        )
+
+    def test_output_same_as_expected_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._case(output_path=self.expected)
+        self.assertIn("标准答案", str(ctx.exception))
+        # 拒绝发生在启动 executor 之前：答案原文未变。
+        self.assertEqual(self.expected.read_text(), "3\n")
+
+    def test_stderr_same_as_expected_rejected(self):
+        with self.assertRaises(ValueError):
+            self._case(output_path=self.root / "out", stderr_path=self.expected)
+        self.assertEqual(self.expected.read_text(), "3\n")
+
+    def test_symlink_alias_rejected(self):
+        link = self.root / "sym.out"
+        os.symlink(self.expected, link)
+        with self.assertRaises(ValueError):
+            self._case(output_path=link)
+        self.assertEqual(self.expected.read_text(), "3\n")
+
+    def test_hardlink_alias_rejected(self):
+        link = self.root / "hard.out"
+        os.link(self.expected, link)
+        with self.assertRaises(ValueError):
+            self._case(output_path=link)
+        self.assertEqual(self.expected.read_text(), "3\n")
+
+    def test_independent_output_runs_and_compares_for_real(self):
+        # 独立输出：确实做了答案比对，错误答案得到 WA 而不是 AC。
+        result = self._case(output_path=self.root / "out")
+        self.assertIs(result.verdict, Verdict.WA)
+        self.assertEqual(self.expected.read_text(), "3\n")
+
+    def test_two_readonly_inputs_may_share_path(self):
+        # 两个只读输入共享路径是允许的；限制只针对写目标。
+        result = judge_case(
+            [sys.executable, "-c", "print(3)"], self.expected, self.expected,
+            Limits(), work_dir=self.root, index=1, checker=None,
+            cgroup_root=self.root / "no-cgroup", isolated=False,
+            drop_privileges=False, output_path=self.root / "out",
+        )
+        self.assertIs(result.verdict, Verdict.AC)
+
+
 class DelegationModeTests(unittest.TestCase):
     """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
 
