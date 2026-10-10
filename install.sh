@@ -131,7 +131,7 @@ fi
 
 if [ "$DO_SMOKE" = 1 ]; then
     info "冒烟测试"
-    if ! ( cd "$pkg" && python3 -c "import judge, memory_cgroup" ); then
+    if ! ( cd "$pkg" && python3 -c "import judge, memory_cgroup, case_io" ); then
         die "模块导入失败"
     fi
     ok "模块导入正常"

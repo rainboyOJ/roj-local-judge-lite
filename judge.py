@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # judge 是唯一的 Python 入口：环境准备、编译、测试点事务、判定与汇总都在这里。
 # 底层的进程执行由独立的 C executor 完成，本文件不实现第二套执行器。
+import case_io
 from memory_cgroup import MemoryCgroup
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -137,20 +138,26 @@ def report_missing_testdata(tried: list[Path]) -> int:
     return 2
 
 
-def load_problem_meta(problem_dir: Path) -> tuple[str, int, int]:
-    """读题目 config.json 的标题、CPU 限制 ms 和内存限制 MiB。
-
-    judge_server 目前忽略这个文件（固定 1000ms / 1GiB），本地工具按题目声明的
-    限制评测更贴近用户预期，也便于用 --time / --memory 覆盖。
-    """
-    title, time_ms, memory_mb = "", 1000, 128
+def _read_problem_config(problem_dir: Path) -> dict:
+    """读题目 config.json 的 JSON 对象；缺失或损坏返回空 dict。"""
     config_path = problem_dir / "config.json"
     if not config_path.is_file():
-        return title, time_ms, memory_mb
+        return {}
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return title, time_ms, memory_mb
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_problem_config(problem_dir: Path) -> tuple[str, int, int, case_io.IOConfig]:
+    """读题目配置：标题、CPU ms、内存 MiB、IO 模式。
+
+    缺少配置文件或字段时用默认值；IO 配置不合法抛 case_io.IOConfigError，
+    由 CLI 在编译前报错退出。
+    """
+    data = _read_problem_config(problem_dir)
+    title, time_ms, memory_mb = "", 1000, 128
     if isinstance(data.get("title"), str):
         title = data["title"]
     for key, default in (("time", time_ms), ("memory", memory_mb)):
@@ -160,6 +167,13 @@ def load_problem_meta(problem_dir: Path) -> tuple[str, int, int]:
                 time_ms = value
             else:
                 memory_mb = value
+    io_config = case_io.parse_io_config(data.get("io"))
+    return title, time_ms, memory_mb, io_config
+
+
+def load_problem_meta(problem_dir: Path) -> tuple[str, int, int]:
+    """兼容包装：只要标题与限制。IO 配置不合法时也向上抛。"""
+    title, time_ms, memory_mb, _ = load_problem_config(problem_dir)
     return title, time_ms, memory_mb
 
 
@@ -929,8 +943,9 @@ def list_problems(testdata_root: Path, tried: list[Path]) -> int:
             continue
         data_dir = problem_dir / "data"
         count = len(load_cases(data_dir)) if data_dir.is_dir() else 0
-        title, time_ms, memory_mb = load_problem_meta(problem_dir)
-        print(f"  {problem_dir.name:<8} {count:>3} 个测试点  {time_ms}ms / {memory_mb}MiB  {title}")
+        title, time_ms, memory_mb, io_config = load_problem_config(problem_dir)
+        mode_note = f"  {io_config.mode}" if io_config.is_file_mode else ""
+        print(f"  {problem_dir.name:<8} {count:>3} 个测试点  {time_ms}ms / {memory_mb}MiB{ mode_note }  {title}")
     return 0
 
 
@@ -1223,7 +1238,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"{data_dir} 下没有配对的 .in/.out 测试点", file=sys.stderr)
         return 2
 
-    title, time_ms, memory_mb = load_problem_meta(problem_dir)
+    title, time_ms, memory_mb = "", 1000, 128
+    try:
+        title, time_ms, memory_mb, io_config = load_problem_config(problem_dir)
+    except case_io.IOConfigError as exc:
+        # 配置错误在编译前退出：不浪费一次编译，也不产生测试点输出。
+        print(f"题目配置错误（{problem_dir / 'config.json'}）：{exc}", file=sys.stderr)
+        return 2
     if args.time is not None:
         time_ms = args.time
     if args.memory is not None:
@@ -1256,6 +1277,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"题目 {args.pid}" + (f"  {title}" if title else ""))
     print(f"提交 {source.name}（{lang}）")
     print(f"限制 CPU {time_ms}ms / 内存 {memory_mb}MiB / wall {limits.resolved_wall_ms()}ms")
+    if io_config.is_file_mode:
+        print(f"IO 文件模式：输入 {io_config.input_file} / 输出 {io_config.output_file}")
+    else:
+        print("IO 标准流模式")
     if isolated:
         print(f"执行 cgroup 隔离，root={cgroup_root}")
     else:

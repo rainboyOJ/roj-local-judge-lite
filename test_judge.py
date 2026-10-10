@@ -3,6 +3,7 @@
 make check；不需要 OJ 数据或 judge_server。"""
 
 import glob
+import json
 import io
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+import case_io
 import judge
 from judge import (ExecutionReport, ExecutorError, Limits, MemoryResult, ProtectionLimits, Verdict,
                    classify_execution, execute_program, judge_case, make_protection_limits)
@@ -167,6 +169,81 @@ class LimitsTests(unittest.TestCase):
         verdict, _ = classify_execution(
             report, MemoryResult(10**12), Limits(time_ms=0, memory_kb=0))
         self.assertEqual(verdict, Verdict.OK)
+
+
+class IOConfigTests(unittest.TestCase):
+    """第一步：config.json 的 io 配置解析与校验。"""
+
+    def test_missing_io_defaults_to_stdio(self):
+        self.assertEqual(case_io.parse_io_config(None), case_io.IOConfig())
+        self.assertEqual(case_io.parse_io_config(None).mode, "stdio")
+
+    def test_valid_file_config(self):
+        cfg = case_io.parse_io_config(
+            {"mode": "file", "input_file": "apple.in", "output_file": "apple.out"})
+        self.assertTrue(cfg.is_file_mode)
+        self.assertEqual(cfg.input_file, "apple.in")
+        self.assertEqual(cfg.output_file, "apple.out")
+
+    def test_stdio_with_filenames_is_ignored_not_fatal(self):
+        # 审核意见：保留文件名以便切换 mode 是合理需求，只提示不报错。
+        with redirect_stdout(io.StringIO()):
+            cfg = case_io.parse_io_config(
+                {"mode": "stdio", "input_file": "x.in", "output_file": "x.out"})
+        self.assertEqual(cfg.mode, "stdio")
+        self.assertIsNone(cfg.input_file)
+
+    def test_invalid_mode_rejected(self):
+        with self.assertRaises(case_io.IOConfigError):
+            case_io.parse_io_config({"mode": "nope"})
+
+    def test_file_mode_requires_both_names(self):
+        for data in ({"mode": "file", "input_file": "a.in"},
+                     {"mode": "file", "output_file": "a.out"},
+                     {"mode": "file"}):
+            with self.subTest(data=data), self.assertRaises(case_io.IOConfigError):
+                case_io.parse_io_config(data)
+
+    def test_path_escape_and_reserved_prefix_rejected(self):
+        bad_names = ("../escape.in", "/abs.in", "dir/name.in", "_judge.x", ".", "..", "")
+        for name in bad_names:
+            with self.subTest(name=name), self.assertRaises(case_io.IOConfigError):
+                case_io.parse_io_config(
+                    {"mode": "file", "input_file": name, "output_file": "ok.out"})
+
+    def test_same_input_and_output_rejected(self):
+        with self.assertRaises(case_io.IOConfigError):
+            case_io.parse_io_config(
+                {"mode": "file", "input_file": "same", "output_file": "same"})
+
+    def test_io_must_be_object(self):
+        for bad in ([1, 2], "file", 5):
+            with self.subTest(bad=bad), self.assertRaises(case_io.IOConfigError):
+                case_io.parse_io_config(bad)
+
+    def test_broken_json_falls_back_to_defaults(self):
+        # 损坏的 config.json 不报 IO 错误，而是用默认值（与现有 meta 行为一致）。
+        with tempfile.TemporaryDirectory(prefix="io-config-") as directory:
+            problem = Path(directory)
+            (problem / "config.json").write_text("{not json")
+            title, time_ms, memory_mb, cfg = judge.load_problem_config(problem)
+        self.assertEqual((title, time_ms, memory_mb), ("", 1000, 128))
+        self.assertEqual(cfg.mode, "stdio")
+
+    def test_bad_io_in_config_is_fatal_at_load(self):
+        with tempfile.TemporaryDirectory(prefix="io-config-") as directory:
+            problem = Path(directory)
+            (problem / "config.json").write_text(
+                json.dumps({"io": {"mode": "file", "input_file": "a.in"}}))
+            with self.assertRaises(case_io.IOConfigError):
+                judge.load_problem_config(problem)
+
+    def test_existing_meta_wrapper_still_works(self):
+        with tempfile.TemporaryDirectory(prefix="io-config-") as directory:
+            problem = Path(directory)
+            (problem / "config.json").write_text(
+                json.dumps({"title": "T", "time": 500, "memory": 64}))
+            self.assertEqual(judge.load_problem_meta(problem), ("T", 500, 64))
 
 
 class BundledTestDataTests(unittest.TestCase):
