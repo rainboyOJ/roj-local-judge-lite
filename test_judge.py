@@ -933,29 +933,36 @@ class DelegationModeTests(unittest.TestCase):
             self.assertEqual(judge._delegate_mode_args(), ["--user"])
             prefix = judge._delegated_prefix()
         self.assertEqual(prefix[:4], ["systemd-run", "--user", "--quiet", "--scope"])
-        # 委派不再经过 examples/delegated.py，而是让本 CLI 自己带 --in-scope 进场。
-        self.assertEqual(prefix[-2:], ["--in-scope", "--"])
-        self.assertTrue(prefix[-3].endswith("judge.py"))
+        # 委派不再经过 examples/delegated.py，也不再有第二个 judge.py：
+        # --in-scope 是本 CLI 自己的选项，后面直接跟原参数。
+        self.assertEqual(prefix[-1], "--in-scope")
+        self.assertTrue(prefix[-2].endswith("judge.py"))
+        self.assertEqual(prefix[-3], sys.executable)
         self.assertNotIn("delegated.py", prefix)
 
-    def test_delegated_command_appends_no_delegate_after_args(self):
-        # --no-delegate 是 judge.py 自己的参数，必须紧跟在原参数之后、
-        # 仍在 `--` 之后（它属于要执行的命令里那一个 CLI 调用）。
+    def test_delegated_command_is_single_layer(self):
+        # 一次 systemd-run、一次 judge.py；原参数直接跟在 --in-scope 之后。
         command = judge._delegated_command(["--pid", "1000", "sum.cpp"])
-        # 取最后一个 `--` 之后的部分：第一个是 systemd-run 自己的分隔符。
-        payload = command[command.index("--", command.index("--") + 1) + 1:]
-        self.assertEqual(payload[-1], "--no-delegate")
-        self.assertEqual(payload[-4:], ["--pid", "1000", "sum.cpp", "--no-delegate"])
-        self.assertEqual(payload[0], sys.executable)
-        self.assertTrue(payload[1].endswith("judge.py"))
+        # 只应出现一个 `--`（systemd-run 自己的分隔符）。
+        self.assertEqual(command.count("--"), 1)
+        # judge.py 只被调用一次：可执行脚本出现一次。
+        self.assertEqual(sum(1 for a in command if a.endswith("judge.py")), 1)
+        self.assertEqual(command[-4:], ["--pid", "1000", "sum.cpp", "--no-delegate"])
+        self.assertEqual(command[-5], "--in-scope")
 
-    def test_in_scope_requires_payload_after_separator(self):
-        # `--in-scope` 之后必须跟 `--` 和要执行的命令，否则是内部调用出错。
+    def test_in_scope_is_a_plain_flag(self):
+        # --in-scope 不再是“后面接一条命令”的形式；非 scope 环境下报错并返回 2。
         err = io.StringIO()
         with redirect_stderr(err):
-            self.assertEqual(judge.run_in_scope(["--in-scope"]), 2)
-            self.assertEqual(judge.run_in_scope(["--in-scope", "--"]), 2)
-        self.assertIn("--in-scope", err.getvalue())
+            code = judge.enter_delegated_scope()
+        self.assertEqual(code, 2)
+        self.assertIn("scope", err.getvalue())
+
+    def test_in_scope_flag_is_accepted_by_the_parser(self):
+        # 现在是 argparse 能识别的选项（隐藏），不再需要绕过参数解析。
+        args = judge.build_parser().parse_args(["--in-scope", "--pid", "1000", "s.cpp"])
+        self.assertTrue(args.in_scope)
+        self.assertEqual(args.pid, "1000")
 
     def test_root_uses_system_manager(self):
         # sudo 会清掉 XDG_RUNTIME_DIR，root 又没有用户管理器，所以必须换成系统管理器。

@@ -105,13 +105,14 @@ os.environ["ROJ_JUDGE_CGROUP_ROOT"] = str(root)
 
 ```text
 systemd-run --user --scope -p Delegate=yes --
-    python3 judge.py --in-scope --
-        python3 judge.py <原来的参数> --no-delegate
+    python3 judge.py --in-scope <原来的参数> --no-delegate
 ```
 
 `Delegate=yes` 请求 systemd 委派该组的管理；代码随后还要检查 scope 是否可写、是否只有本进程、是否有 memory controller。不是任意找到一个目录就直接改动。
 
-`try_auto_delegate()` 的探测和真正评测使用不同的新 scope。探测成功后，真实 scope 仍会执行自己的准备检查。
+`--in-scope` 是本 CLI 自己的一个（隐藏）选项，后面直接跟原参数：**同一个进程**在 scope 内准备好父目录，然后继续走正常评测流程，不再 exec 第二个 judge.py。它换掉的只是最初那个普通进程。
+
+`try_auto_delegate()` 的探测和真正评测使用不同的新 scope。探测直接在短命子进程里调用 `prepare_delegated_scope()`——与真实准备是同一段代码，不是“同一种命令形状”。探测成功后，真实 scope 仍会执行自己的准备检查。
 
 ### 3.2 把当前 Python 进程搬到 manager
 
@@ -136,11 +137,11 @@ systemd-run --user --scope -p Delegate=yes --
 
 “scope 自身无进程”指它自己的 `cgroup.procs` 为空，不是要求所有子组也为空。
 
-### 3.3 换成正式评测程序，继续留在 manager
+### 3.3 同一进程继续评测
 
-准备完成后，`run_in_scope()` 用 `os.execvp()` 执行 `--` 后的正式命令。
+准备完成后，`main()` 不换程序，直接往下走：解析题目、编译、逐点执行。当前进程已经在 manager，并从 `ROJ_JUDGE_CGROUP_ROOT` 找到 scope 父目录。
 
-这里的 exec 替换当前进程运行的程序，不是再 fork 一个子进程。PID 和所在 cgroup 保留，环境变量也传下去，所以正式 `judge.py` 已经位于 manager，并能从 `ROJ_JUDGE_CGROUP_ROOT` 找到 scope 父目录。
+这里没有任何 exec：`--in-scope` 只是让开头多做一个准备步骤。早先的版本会在这里 `execvp` 成第二个 `judge.py`，那层已被合并掉——`--in-scope` 之后跟的就是它自己的评测参数。
 
 `--no-delegate` 避免再次进入自动委派流程。之后编译器和 executor 作为 judge 启动的子进程，初始也位于 manager。
 
@@ -374,13 +375,13 @@ OOM → wall 超时 → 内存峰值超限 → CPU 超限 / SIGXCPU
 
 ```bash
 make
-systemd-run --user --quiet --scope -p Delegate=yes -- python3 judge.py --in-scope -- python3 - <<'PY'
+systemd-run --user --quiet --scope -p Delegate=yes -- python3 - <<'PY'
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
-from judge import Limits, Verdict, execute_program
+from judge import Limits, Verdict, execute_program, prepare_delegated_scope
 
 
 def cgroup_of(pid):
@@ -389,6 +390,9 @@ def cgroup_of(pid):
     return line.split('::', 1)[1]
 
 
+# 自己做 scope 准备：--in-scope 分支平时就是调用它，然后同一个进程继续。
+ok, why = prepare_delegated_scope()
+assert ok, why
 root = Path(os.environ['ROJ_JUDGE_CGROUP_ROOT'])
 manager = cgroup_of(os.getpid())
 print('judge cgroup:', manager)
