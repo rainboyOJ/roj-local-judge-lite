@@ -147,6 +147,52 @@ systemd-run --user --scope -p Delegate=yes --
 
 注意：manager 只是不受某个 `case-*` 的限制，仍受祖先 cgroup 的限制。它也不会因为名字叫 manager 就自动获得管理权限；能操作 cgroup 文件，依赖实际的委派和文件权限。
 
+### 3.4 一次委派运行从参数到评测的完整顺序
+
+把上文串起来，第二次执行的顺序是：
+
+```text
+main()  解析参数，得到 args.in_scope == True
+   ↓
+enter_delegated_scope()          ← 立刻执行，早于任何读题目/找数据的动作
+   ↓
+prepare_delegated_scope()
+   · mkdir manager
+   · 把自己的 PID 写进 manager/cgroup.procs
+   · 写 scope/cgroup.subtree_control = "+memory"
+   · 设 ROJ_JUDGE_CGROUP_ROOT
+   ↓
+同一个进程继续：
+   · resolve_testdata()            找测试数据
+   · load_problem_config()         读题目限制与 IO 模式
+   · resolve_checker()             选比较器
+   · check_cgroup_root(cgroup_root)  判断隔离是否可用
+   ↓
+judge_submission()
+   · compile_submission()          编译一次
+   · 每个测试点：case_io.prepare_case_files() → judge_case()
+```
+
+两个时机容易看错，值得单独指出：
+
+**准备必须早于 `check_cgroup_root()`。** 后面这一步读的就是前面设好的环境变量：
+
+```python
+cgroup_root = Path(args.cgroup_root or os.environ.get("ROJ_JUDGE_CGROUP_ROOT", DEFAULT_CGROUP_ROOT))
+isolated, reason = check_cgroup_root(cgroup_root)
+```
+
+如果准备放在后面，`isolated` 会得到 `False`，整次运行会错误地走到降级路径。这也是 `--in-scope` 分支必须紧跟 `parse_args()` 的原因。
+
+**“准备环境”和“准备题目数据”是两层，不要混为一谈。**
+
+| 层次 | 谁做 | 做什么 |
+| --- | --- | --- |
+| cgroup 层 | `prepare_delegated_scope()` | 建 `manager`、搬自己进去、开 `+memory`、设环境变量 |
+| 评测层 | `judge_submission()` 循环里的 `case_io.prepare_case_files()` | 建 `work/case-N`、复制 `apple.in`、设权限与属主 |
+
+前者只碰 cgroup 文件，不涉及题目数据；后者才在每个测试点开始前准备输入副本与运行目录。
+
 ## 4. 创建一个 case，只是准备笼子，还没有把程序放进去
 
 现在回到 `_run_transaction()`。下面是它与入笼直接相关的代码骨架，省略其他参数：
