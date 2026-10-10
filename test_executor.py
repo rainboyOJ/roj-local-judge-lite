@@ -298,6 +298,99 @@ class ExecutionTestsMixin:
         self.assertEqual(self.output.read_text().strip(), "65534 65534 []")
 
 
+class ExecutorArgumentTests(unittest.TestCase):
+    """executor 的键值对参数解析：顺序无关、严格校验（不需 cgroup，不需 root）。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="exec-args-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "in"
+        self.input.write_text("3 4\n")
+        self.output = self.root / "out"
+        self.executor = Path(__file__).resolve().parent / "executor"
+        if not self.executor.is_file():
+            self.skipTest("executor 尚未构建")
+
+    def _run(self, args):
+        return subprocess.run([str(self.executor)] + args,
+                              capture_output=True, text=True, timeout=30)
+
+    def _base(self, **override):
+        opts = {
+            "--cwd": str(self.root), "--input": str(self.input),
+            "--output": str(self.output), "--drop-privileges": "0",
+        }
+        opts.update(override)
+        args = []
+        for name, value in opts.items():
+            if value is not None:
+                args += [name, value]
+        return args
+
+    def test_named_options_any_order(self):
+        # 把必需项顺序打乱，仍应正常执行并把 stdout 写到 --output。
+        args = ["--output", str(self.output), "--cwd", str(self.root),
+                "--drop-privileges", "0", "--input", str(self.input),
+                "--cpu-seconds", "1", "--wall-ms", "2000", "--", "/bin/cat"]
+        proc = self._run(args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.output.read_text(), "3 4\n")
+        self.assertIn('"exit_code":0', proc.stdout)
+
+    def test_missing_required_option_exits_125(self):
+        proc = self._run(self._base(**{"--cwd": None}) + ["--", "/bin/true"])
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("--cwd", proc.stderr)
+
+    def test_unknown_option_exits_125(self):
+        proc = self._run(self._base() + ["--bogus", "1", "--", "/bin/true"])
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("unknown option", proc.stderr)
+
+    def test_duplicate_option_exits_125(self):
+        proc = self._run(self._base() + ["--cwd", str(self.root), "--", "/bin/true"])
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("duplicate option", proc.stderr)
+
+    def test_option_without_value_exits_125(self):
+        proc = self._run(["--cwd"])
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("requires a value", proc.stderr)
+
+    def test_out_of_range_uid_and_drop_exit_125(self):
+        for extra, needle in (
+                (["--drop-privileges", "2"], "drop-privileges"),
+                (["--uid", str(2**40)], "uid"),
+        ):
+            with self.subTest(extra=extra):
+                proc = self._run(self._base() + extra + ["--", "/bin/true"])
+                self.assertEqual(proc.returncode, 125)
+                self.assertIn(needle, proc.stderr)
+
+    def test_default_stderr_falls_back_to_output_err(self):
+        src = "import sys; sys.stderr.write('diag'); sys.stdout.write('o')"
+        args = self._base() + ["--", sys.executable, "-c", src]
+        proc = self._run(args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((self.root / "out.err").read_text(), "diag")
+        self.assertEqual(self.output.read_text(), "o")
+
+    def test_empty_cgroup_procs_disables_group_join(self):
+        # 空串是显式禁用入组；不传该选项同样如此，不应报错。
+        args = self._base() + ["--cgroup-procs", "", "--", "/bin/cat"]
+        proc = self._run(args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.output.read_text(), "3 4\n")
+
+    def test_program_after_double_dash_is_not_parsed_as_option(self):
+        # `--` 之后的 `--cpu-seconds` 只是提交自己的参数，不能被解析。
+        args = self._base() + ["--", "/bin/echo", "--cpu-seconds", "9"]
+        proc = self._run(args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.output.read_text(), "--cpu-seconds 9\n")
+
+
 class ExecutionReportTests(unittest.TestCase):
     """执行事实与判定的契约边界：报告解析、异常通道、取消传播。"""
 

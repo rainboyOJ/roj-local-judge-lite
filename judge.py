@@ -517,16 +517,20 @@ class Limits:
                 raise ValueError(f"{field.name} 必须是非负整数")
 
     def executor_args(self, cgroup_procs: Optional[Path] = None) -> list[str]:
-        """转换为 executor 的内部参数；顺序对应 C 中的 parse_options。
+        """转换为 executor 的命名参数（--name value）；顺序无关。
 
-        保护值的计算集中在 make_protection_limits()；本方法只负责把结果
-        排成 C 期望的顺序。cgroup 参数为空字符串时表示显式关闭入组；
-        Popen 直接传递参数数组，因此空参数不会被吞掉。
+        保护值的计算集中在 make_protection_limits()。cgroup_procs 为 None 时
+        不传 --cgroup-procs，executor 视为显式禁用入组；其余必需项
+        （--cwd/--input/--output/--）由 judge 在拼命令时补齐。
         """
         p = make_protection_limits(self)
-        args = [str(p.cpu_seconds), str(p.stack_bytes), str(p.output_bytes),
-                str(p.nproc), str(p.wall_ms)]
-        args.insert(1, str(cgroup_procs) if cgroup_procs is not None else "")
+        args = ["--cpu-seconds", str(p.cpu_seconds),
+                "--stack-bytes", str(p.stack_bytes),
+                "--output-bytes", str(p.output_bytes),
+                "--nproc", str(p.nproc),
+                "--wall-ms", str(p.wall_ms)]
+        if cgroup_procs is not None:
+            args += ["--cgroup-procs", str(cgroup_procs)]
         return args
 
 
@@ -1046,9 +1050,15 @@ def _run_transaction(run_argv: list[str], input_path: Path, output_path: Path,
         context = MemoryCgroup(root, protection.memory_max_bytes) if isolated else nullcontext()
         with context as group:
             command = [
-                str(executor), *limits.executor_args(group.procs_path if group is not None else None),
-                str(int(drop)), str(run_uid), str(run_gid),
-                str(work_dir_abs), str(input_abs), str(output_abs), str(stderr_abs), *argv,
+                str(executor),
+                *limits.executor_args(group.procs_path if group is not None else None),
+                "--drop-privileges", str(int(drop)),
+                "--uid", str(run_uid), "--gid", str(run_gid),
+                "--cwd", str(work_dir_abs),
+                "--input", str(input_abs),
+                "--output", str(output_abs),
+                "--stderr", str(stderr_abs),
+                "--", *argv,
             ]
             report = invoke_executor(command, _child_env(work_dir_abs, inherit_env))
             memory: Optional[MemoryResult] = None

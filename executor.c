@@ -52,6 +52,12 @@ struct Options {
   char **command;
 };
 
+/* 每个选项是否已经出现过；重复出现说明调用方拼错了参数。 */
+struct Seen {
+  int cpu_seconds, wall_ms, stack_bytes, output_bytes, nproc;
+  int drop_privileges, uid, gid, cwd, input, output, error, cgroup_procs;
+};
+
 /* ── step 08 · 等待与看门狗（第 06 章「第四步」）─────────────────────── */
 struct Result {
   int status;
@@ -100,36 +106,136 @@ static unsigned long long parse_number(const char *text) {
   return value;
 }
 
+static void usage(void) {
+  fprintf(stderr,
+          "usage: executor --cwd DIR --input FILE --output FILE\n"
+          "                [--stderr FILE] [--cgroup-procs FILE]\n"
+          "                [--cpu-seconds N] [--wall-ms N] [--stack-bytes N]\n"
+          "                [--output-bytes N] [--nproc N]\n"
+          "                [--drop-privileges 0|1] [--uid N] [--gid N]\n"
+          "                -- PROGRAM [ARG...]\n");
+}
+
+static void die_missing(const char *what) {
+  fprintf(stderr, "executor: missing required option %s\n", what);
+  usage();
+  exit(125);
+}
+
+static void die_duplicate(const char *what) {
+  fprintf(stderr, "executor: duplicate option %s\n", what);
+  exit(125);
+}
+
+static void die_unknown(const char *what) {
+  fprintf(stderr, "executor: unknown option %s\n", what);
+  usage();
+  exit(125);
+}
+
+/* 取选项的值：选项与其值成对出现，缺少值直接报错。 */
+static const char *value_of(int argc, char **argv, int *index, const char *name) {
+  if (*index + 1 >= argc) {
+    fprintf(stderr, "executor: option %s requires a value\n", name);
+    exit(125);
+  }
+  *index += 1;
+  return argv[*index];
+}
+
+/* 解析一次运行的全部参数。选项按名字匹配，与出现顺序无关。
+ * 未识别的选项、缺少必需项、重复选项都直接退出 125，不静默取默认值；
+ * 这样 Python 侧改名或插入参数时，错误会在启动阶段暴露而不是错位执行。 */
 static struct Options parse_options(int argc, char **argv) {
-  if (argc < 15) {
-    fprintf(stderr, "executor: missing required execution arguments\n");
-    exit(125);
+  struct Options options = {0};
+  struct Seen seen = {0};
+
+  for (int index = 1; index < argc; index++) {
+    const char *name = argv[index];
+    if (strcmp(name, "--") == 0) {
+      /* `--` 之后是要运行的程序及其参数，原样交给 execvp。 */
+      if (index + 1 >= argc) {
+        fprintf(stderr, "executor: no program after --\n");
+        exit(125);
+      }
+      options.command = &argv[index + 1];
+      break;
+    } else if (strcmp(name, "--cpu-seconds") == 0) {
+      if (seen.cpu_seconds++) die_duplicate(name);
+      options.cpu_seconds = parse_number(value_of(argc, argv, &index, name));
+    } else if (strcmp(name, "--wall-ms") == 0) {
+      if (seen.wall_ms++) die_duplicate(name);
+      options.wall_ms = parse_number(value_of(argc, argv, &index, name));
+    } else if (strcmp(name, "--stack-bytes") == 0) {
+      if (seen.stack_bytes++) die_duplicate(name);
+      options.stack_bytes = parse_number(value_of(argc, argv, &index, name));
+    } else if (strcmp(name, "--output-bytes") == 0) {
+      if (seen.output_bytes++) die_duplicate(name);
+      options.output_bytes = parse_number(value_of(argc, argv, &index, name));
+    } else if (strcmp(name, "--nproc") == 0) {
+      if (seen.nproc++) die_duplicate(name);
+      options.nproc = parse_number(value_of(argc, argv, &index, name));
+    } else if (strcmp(name, "--drop-privileges") == 0) {
+      if (seen.drop_privileges++) die_duplicate(name);
+      unsigned long long drop = parse_number(value_of(argc, argv, &index, name));
+      if (drop > 1) {
+        fprintf(stderr, "executor: --drop-privileges must be 0 or 1\n");
+        exit(125);
+      }
+      options.drop_privileges = (int)drop;
+    } else if (strcmp(name, "--uid") == 0) {
+      if (seen.uid++) die_duplicate(name);
+      unsigned long long uid = parse_number(value_of(argc, argv, &index, name));
+      if (uid >= (uid_t)-1) {
+        fprintf(stderr, "executor: --uid out of range\n");
+        exit(125);
+      }
+      options.uid = (uid_t)uid;
+    } else if (strcmp(name, "--gid") == 0) {
+      if (seen.gid++) die_duplicate(name);
+      unsigned long long gid = parse_number(value_of(argc, argv, &index, name));
+      if (gid >= (gid_t)-1) {
+        fprintf(stderr, "executor: --gid out of range\n");
+        exit(125);
+      }
+      options.gid = (gid_t)gid;
+    } else if (strcmp(name, "--cwd") == 0) {
+      if (seen.cwd++) die_duplicate(name);
+      options.cwd = value_of(argc, argv, &index, name);
+    } else if (strcmp(name, "--input") == 0) {
+      if (seen.input++) die_duplicate(name);
+      options.input = value_of(argc, argv, &index, name);
+    } else if (strcmp(name, "--output") == 0) {
+      if (seen.output++) die_duplicate(name);
+      options.output = value_of(argc, argv, &index, name);
+    } else if (strcmp(name, "--stderr") == 0) {
+      if (seen.error++) die_duplicate(name);
+      options.error = value_of(argc, argv, &index, name);
+    } else if (strcmp(name, "--cgroup-procs") == 0) {
+      if (seen.cgroup_procs++) die_duplicate(name);
+      const char *value = value_of(argc, argv, &index, name);
+      /* 空字符串表示显式禁用 cgroup；非空路径打不开时必须报错，不能降级。 */
+      options.cgroup_procs = *value ? value : NULL;
+    } else {
+      die_unknown(name);
+    }
   }
-  unsigned long long drop = parse_number(argv[7]);
-  unsigned long long uid = parse_number(argv[8]);
-  unsigned long long gid = parse_number(argv[9]);
-  if (drop > 1 || uid >= (uid_t)-1 || gid >= (gid_t)-1) {
-    fprintf(stderr, "invalid uid/gid/drop_privileges\n");
-    exit(125);
+
+  if (!options.cwd) die_missing("--cwd");
+  if (!options.input) die_missing("--input");
+  if (!options.output) die_missing("--output");
+  if (!options.command) die_missing("-- PROGRAM");
+  if (!options.error) {
+    /* 未给出 --stderr 时沿用 OUTPUT + ".err"；静态缓冲存活到进程结束。 */
+    static char fallback[PATH_MAX];
+    if (snprintf(fallback, sizeof(fallback), "%s.err", options.output)
+        >= (int)sizeof(fallback)) {
+      fprintf(stderr, "executor: --output path too long\n");
+      exit(125);
+    }
+    options.error = fallback;
   }
-  /* 只有这里依赖参数顺序；其余代码都使用有含义的字段名。 */
-  return (struct Options){
-      /* 空参数表示显式禁用 cgroup；非空路径打不开时必须报错，不能自动降级。 */
-      .cpu_seconds = parse_number(argv[1]),
-      .cgroup_procs = *argv[2] ? argv[2] : NULL,
-      .stack_bytes = parse_number(argv[3]),
-      .output_bytes = parse_number(argv[4]),
-      .nproc = parse_number(argv[5]),
-      .wall_ms = parse_number(argv[6]),
-      .drop_privileges = drop,
-      .uid = uid,
-      .gid = gid,
-      .cwd = argv[10],
-      .input = argv[11],
-      .output = argv[12],
-      .error = argv[13],
-      .command = &argv[14],
-  };
+  return options;
 }
 
 /* step 09：把「哪一步失败了」写进私有管道，而不是只留一个退出码。 */

@@ -87,12 +87,28 @@ class LocalJudgeTests(unittest.TestCase):
 
 
 class LimitsTests(unittest.TestCase):
+    def _opt(self, args, name):
+        """取键值对形式参数的值；args 形如 [--name, value, ...]。"""
+        return args[args.index(name) + 1]
+
     def test_protection_limits_include_margin(self):
         limits = Limits()
-        self.assertEqual(limits.executor_args(Path("/group/cgroup.procs"))[0], "2")
+        args = limits.executor_args(Path("/group/cgroup.procs"))
+        self.assertEqual(self._opt(args, "--cpu-seconds"), "2")
+        self.assertEqual(self._opt(args, "--cgroup-procs"), "/group/cgroup.procs")
         self.assertEqual(limits.memory_max_bytes(), 144 * 1024 * 1024)
-        self.assertEqual(Limits(time_ms=0).executor_args(Path("/group/cgroup.procs"))[0], "0")
+        zero = Limits(time_ms=0).executor_args(Path("/group/cgroup.procs"))
+        self.assertEqual(self._opt(zero, "--cpu-seconds"), "0")
         self.assertEqual(Limits(memory_kb=0).memory_max_bytes(), 0)
+
+    def test_executor_args_are_named_and_order_independent(self):
+        # 没有 cgroup 时不传 --cgroup-procs（executor 视为禁用入组）。
+        args = Limits().executor_args(None)
+        self.assertNotIn("--cgroup-procs", args)
+        # 每个选项后面紧跟其值，成对出现。
+        for i in range(0, len(args), 2):
+            self.assertTrue(args[i].startswith("--"), f"{args[i]} 不是选项名")
+            self.assertFalse(args[i + 1].startswith("--"), f"{args[i]} 缺少值")
 
     def test_make_protection_limits_is_the_single_calculation_point(self):
         p = make_protection_limits(Limits())
