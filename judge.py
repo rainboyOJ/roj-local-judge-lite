@@ -453,11 +453,16 @@ def run_delegated(raw_args: list[str]) -> int:
 
 
 class Verdict(str, enum.Enum):
-    OK = "OK"
+    """测试点最终判定；OK 只是内部中间态，SYSTEM_ERROR 是基础设施故障。"""
+
+    OK = "OK"                # 内部：执行正常，可以比较答案；不作为最终结果输出
+    AC = "AC"
+    WA = "WA"
     TLE = "TLE"
     MLE = "MLE"
     RE = "RE"
-    SYSTEM_ERROR = "SYSTEM_ERROR"
+    SE = "SE"                # 基础设施故障（对应内部的 SYSTEM_ERROR）
+    SYSTEM_ERROR = "SYSTEM_ERROR"  # 判定函数的中间态；展示前会映射为 SE
 
 
 @dataclasses.dataclass
@@ -580,32 +585,66 @@ class ExecutionReport:
 
 @dataclasses.dataclass
 class CaseResult:
-    verdict: Verdict = Verdict.SYSTEM_ERROR
-    cpu_time_us: int = 0
-    cpu_time_ms: int = 0
-    real_time_ms: int = 0
-    memory_kb: int = 0
-    """cgroup memory.peak 的 KiB 展示值；精确比较使用下面的字节数。"""
+    """一个测试点的最终结果；verdict 是唯一的判定来源（AC/WA/TLE/MLE/RE/SE）。
 
-    memory_peak_bytes: int = 0
-    rss_kb: int = 0
-    """wait4 的 ru_maxrss，仅作辅助诊断，不用于内存判定。"""
+    执行事实放在 report，内存统计放在 memory（None 表示未测量）。展示、
+    汇总和序列化都读本对象，不再维护另一份可能不同步的局部判定。
+    """
 
-    oom_events: int = 0
-    oom_kills: int = 0
-
-    timed_out: bool = False
-    signal: int = 0
-    exit_code: int = 0
+    verdict: Verdict = Verdict.SE
     message: str = ""
+    """判定原因或基础设施故障描述（含可能的清理诊断）。"""
+
+    report: Optional[ExecutionReport] = None
+    """执行器报告的执行事实；启动失败等场景为 None。"""
+
+    memory: Optional[MemoryResult] = None
+    """cgroup 内存统计；无 cgroup 时为 None，不拿 RSS 补位。"""
+
     output_path: str = ""
     stderr_path: str = ""
 
+    # 展示用便捷属性：从 report/memory 派生，避免调用方到处判空。
+    @property
+    def cpu_time_ms(self) -> int:
+        return self.report.cpu_time_ms if self.report else 0
+
+    @property
+    def cpu_time_us(self) -> int:
+        return self.report.cpu_time_us if self.report else 0
+
+    @property
+    def real_time_ms(self) -> int:
+        return self.report.real_time_ms if self.report else 0
+
+    @property
+    def rss_kb(self) -> int:
+        return self.report.rss_kb if self.report else 0
+
+    @property
+    def timed_out(self) -> bool:
+        return self.report.timed_out if self.report else False
+
+    @property
+    def signal(self) -> int:
+        return self.report.signal if self.report else 0
+
+    @property
+    def exit_code(self) -> int:
+        return self.report.exit_code if self.report else 0
+
+    @property
+    def memory_kb(self) -> int:
+        return (self.memory.peak_bytes + 1023) // 1024 if self.memory else 0
+
     def to_dict(self) -> Dict[str, object]:
-        """给 CLI 的 JSON 输出。"""
-        result = dataclasses.asdict(self)
-        result["verdict"] = self.verdict.value
-        return result
+        """序列化；verdict 与对象一致，不会出现两套表示。"""
+        return {
+            "verdict": self.verdict.value,
+            "message": self.message,
+            "output_path": self.output_path,
+            "stderr_path": self.stderr_path,
+        }
 
 
 def _child_env(work_dir: Path, inherit: bool) -> Dict[str, str]:
@@ -858,28 +897,18 @@ def run_case(
                 # 峰值和 OOM 事件；with 的退出清理也覆盖启动失败和 Ctrl+C。
                 group.stop()
                 memory = MemoryResult.from_group(group.memory_result())
-            # 执行事实 → 结果的适配（过渡形态）：下一步搬进 judge_case。
-            result = CaseResult(
-                verdict=Verdict.OK, cpu_time_us=report.cpu_time_us,
-                cpu_time_ms=report.cpu_time_ms, real_time_ms=report.real_time_ms,
-                memory_peak_bytes=memory.peak_bytes if memory else 0,
-                memory_kb=(memory.peak_bytes // 1024) if memory else 0,
-                rss_kb=report.rss_kb,
-                oom_events=memory.oom_events if memory else 0,
-                oom_kills=memory.oom_kills if memory else 0,
-                timed_out=report.timed_out, signal=report.signal,
-                exit_code=report.exit_code,
-            )
-        # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
-        # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
-        result.verdict, result.message = classify_execution(report, memory, limits)
+            # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
+            # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
+            verdict, message = classify_execution(report, memory, limits)
+            result = CaseResult(verdict=verdict, message=message,
+                                report=report, memory=memory)
     except KeyboardInterrupt:
         # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
         # 清理失败已作为诊断挂在异常上（见 MemoryCgroup.__exit__）。
         raise
     except (OSError, ExecutorError) as exc:
         # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
-        result = CaseResult(message=_describe_failure(exc))
+        result = CaseResult(verdict=Verdict.SE, message=_describe_failure(exc))
 
     result.output_path = str(output_path)
     result.stderr_path = str(stderr_path)
@@ -891,25 +920,28 @@ def run_case(
 # --------------------------------------------------------------------------
 
 
-def format_case_line(index: int, name: str, verdict: str, result: CaseResult,
-                     detail: str) -> str:
+def format_case_line(index: int, name: str, result: CaseResult) -> str:
+    """一行展示；判定与详情都只从 result 读取。"""
+    verdict = result.verdict.value
     timing = f"{result.cpu_time_ms:>5}ms {result.memory_kb / 1024:>6.1f}MiB"
     line = f"  #{index:<3} {name:<12} {verdict:<6} {timing}"
+    detail = describe(result)
     return f"{line}   {detail}" if detail else line
 
 
-def describe(result: CaseResult, verdict: str, expected_path: Path,
-             user_output: Path) -> str:
-    if verdict == "AC":
+def describe(result: CaseResult) -> str:
+    """把结果的判定与事实转成一行详情；不再接受外部传入的判定。"""
+    verdict = result.verdict
+    if verdict is Verdict.AC:
         return ""
-    if verdict == "WA":
-        return first_difference(expected_path, user_output)
-    if verdict == "TLE":
+    if verdict is Verdict.WA:
+        return result.message  # judge_case 已算好首行差异
+    if verdict is Verdict.TLE:
         wall = "wall 超时，" if result.timed_out else ""
         return f"{wall}CPU {result.cpu_time_ms}ms / 实际 {result.real_time_ms}ms"
-    if verdict == "MLE":
+    if verdict is Verdict.MLE:
         return f"内存峰值 {result.memory_kb / 1024:.1f}MiB"
-    if verdict == "RE":
+    if verdict is Verdict.RE:
         if result.signal:
             return f"被信号 {result.signal} 终止"
         return f"退出码 {result.exit_code}"
@@ -984,15 +1016,15 @@ def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
 
 def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
                limits: Limits, *, work_dir: Path, index: int, checker: Optional[Path],
-               cgroup_root: Path, isolated: bool) -> tuple[str, str, CaseResult]:
+               cgroup_root: Path, isolated: bool) -> CaseResult:
     """一个测试点的事务：执行 → 资源收尾 → 判定 → 比较答案。
 
-    返回 (最终 verdict, detail, result)。最终 verdict 不暴露内部的 OK：
-    只有内部 OK 才比较答案，得到 AC/WA；SYSTEM_ERROR 映射为 SE。
+    返回单个 CaseResult，其 verdict 就是最终判定（AC/WA/TLE/MLE/RE/SE）。
+    内部的 OK 不会成为最终结果：只有执行正常（OK）才比较答案，得到 AC/WA。
 
-    资源生命周期完全在本函数内：run_case 内部用 `with MemoryCgroup(...)`
-    包住创建→执行→停止→读统计→删除（无 cgroup 时用空上下文），所以
-    这里看不到 cgroup 文件操作，只有一次调用。
+    资源生命周期由 run_case 用 `with MemoryCgroup(...)` 包住
+    （创建→执行→停止→读统计→删除，无 cgroup 时用空上下文），所以这里
+    看不到 cgroup 文件操作，只有一次调用。
     """
     user_output = work_dir / f"case-{index}.out"
     stderr_path = work_dir / f"case-{index}.err"
@@ -1003,14 +1035,15 @@ def judge_case(run_argv: list[str], input_path: Path, expected_path: Path,
         stderr_path=stderr_path, cwd=work_dir,
         cgroup_root=cgroup_root, use_cgroup=isolated,
     )
-    verdict = result.verdict.value
-    if verdict == "OK":
-        verdict = "AC" if compare_output(input_path, expected_path,
-                                         user_output, checker) else "WA"
-    elif verdict == "SYSTEM_ERROR":
-        verdict = "SE"
-    detail = result.message if verdict == "SE" else describe(result, verdict, expected_path, user_output)
-    return verdict, detail, result
+    # 只有执行正常时才看答案——OK 是内部中间态，在此处收口成 AC/WA。
+    if result.verdict is Verdict.OK:
+        ac = compare_output(input_path, expected_path, user_output, checker)
+        result.verdict = Verdict.AC if ac else Verdict.WA
+        if not ac:
+            result.message = first_difference(expected_path, user_output)
+    elif result.verdict is Verdict.SYSTEM_ERROR:
+        result.verdict = Verdict.SE
+    return result
 
 
 def judge_submission(run_argv: list[str], cases: list[tuple[str, Path, Path]],
@@ -1019,17 +1052,18 @@ def judge_submission(run_argv: list[str], cases: list[tuple[str, Path, Path]],
     """编译好之后的完整评测：逐点调用 judge_case，展示并汇总。
 
     只负责流程与汇总；单个测试点的资源生命周期在 judge_case 里。
+    展示、汇总都只读 CaseResult.verdict，不再维护另一份局部判定。
     返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1。
     """
     started = time.monotonic()
     verdicts: list[str] = []
     for index, (name, input_path, expected_path) in enumerate(cases, start=1):
-        verdict, detail, result = judge_case(
+        result = judge_case(
             run_argv, input_path, expected_path, limits, work_dir=work_dir,
             index=index, checker=checker, cgroup_root=cgroup_root, isolated=isolated,
         )
-        verdicts.append(verdict)
-        print(format_case_line(index, name, verdict, result, detail))
+        verdicts.append(result.verdict.value)
+        print(format_case_line(index, name, result))
 
     elapsed = time.monotonic() - started
     passed = verdicts.count("AC")

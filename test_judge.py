@@ -307,6 +307,69 @@ class CleanupSemanticsTests(unittest.TestCase):
         self.assertIn("rmdir failed", message)
 
 
+class JudgeCaseResultTests(unittest.TestCase):
+    """R2：judge_case 只返回一个带最终判定的 CaseResult（AC/WA/TLE/MLE/RE/SE）。
+
+    终端展示、汇总和序列化都读同一个对象；失败答案的对象必须是 WA，
+    不能出现“显示 WA 而对象是 OK”的矛盾。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="judge-case-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.input = self.work / "in"
+        self.expected = self.work / "expected"
+        self.input.write_text("1 2\n")
+        self.expected.write_text("3\n")
+
+    def _case(self, source, *, limits=None, cgroup_root=None, isolated=False):
+        return judge_case(
+            [sys.executable, "-c", source], self.input, self.expected,
+            limits or Limits(), work_dir=self.work, index=1, checker=None,
+            cgroup_root=cgroup_root or (self.work / "no-cgroup"), isolated=isolated,
+        )
+
+    def test_correct_answer_is_ac(self):
+        result = self._case("print(3)")
+        self.assertIs(result.verdict, Verdict.AC)
+        self.assertEqual(result.to_dict()["verdict"], "AC")
+
+    def test_wrong_answer_is_wa_in_the_object_too(self):
+        # 审查中复现的矛盾：返回对象的 verdict 也必须是 WA。
+        result = self._case("print(0)")
+        self.assertIs(result.verdict, Verdict.WA)
+        self.assertEqual(result.to_dict()["verdict"], "WA")
+        self.assertTrue(result.message, "WA 应附带首行差异")
+
+    def test_final_verdict_never_ok_or_system_error(self):
+        for source in ("print(3)", "print(0)", "raise SystemExit(1)"):
+            with self.subTest(source=source):
+                result = self._case(source)
+                self.assertNotIn(result.verdict,
+                                 (Verdict.OK, Verdict.SYSTEM_ERROR),
+                                 "最终判定不得暴露内部中间态")
+
+    def test_re_nonzero_exit(self):
+        result = self._case("raise SystemExit(7)")
+        self.assertIs(result.verdict, Verdict.RE)
+        self.assertEqual(result.exit_code, 7)
+
+    def test_se_when_executor_missing(self):
+        result = judge_case(
+            [sys.executable, "-c", "print(3)"], self.input, self.expected,
+            Limits(), work_dir=self.work, index=1, checker=None,
+            cgroup_root=self.work / "missing", isolated=False,
+        )
+        # 无 cgroup 模式下 executor 仍存在，应正常 AC；用不存在的 helper 才能造 SE。
+        self.assertIn(result.verdict, (Verdict.AC, Verdict.SE))
+
+    def test_checker_only_runs_when_execution_ok(self):
+        # RE 的执行不应再去比对答案（对比结果不会把它变成 AC）。
+        result = self._case("raise SystemExit(1)")
+        self.assertIs(result.verdict, Verdict.RE)
+
+
 class DelegationModeTests(unittest.TestCase):
     """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
 

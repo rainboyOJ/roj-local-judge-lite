@@ -159,13 +159,13 @@ class ExecutionTestsMixin:
     def test_missing_input_is_setup_error(self):
         self.input.unlink()
         result = self.run_python("pass")
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
         self.assertIn("redirect stdin", result.message)
 
     def test_failed_exec_is_setup_error(self):
         result = self.run_case([str(self.root / "missing")], self.input, self.output,
                                drop_privileges=False)
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
         self.assertIn("exec", result.message)
 
     def test_user_exit_codes_and_stderr_are_not_setup_or_mle(self):
@@ -184,7 +184,7 @@ class ExecutionTestsMixin:
 
     def test_missing_helper_is_system_error(self):
         result = self.run_python("pass", helper_path=self.root / "no-helper")
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
         self.assertIn("make", result.message)
 
     def test_timeout_kills_descendants(self):
@@ -328,7 +328,7 @@ class ExecutionReportTests(unittest.TestCase):
         self.assertIn("executor", str(ctx.exception))
 
     def test_startup_failure_maps_to_system_error(self):
-        # run_case 是事务边界：基础设施故障必须转成 SYSTEM_ERROR。
+        # run_case 是事务边界：基础设施故障必须转成 SE。
         # 用 --helper 指向不存在的二进制，确保是 executor 启动失败，
         # 而不是提交程序路径无效。
         with tempfile.TemporaryDirectory(prefix="executor-test-") as directory:
@@ -340,11 +340,11 @@ class ExecutionReportTests(unittest.TestCase):
                 helper_path=root / "no-such-executor",
             )
         self.assertNotEqual(result.verdict, Verdict.RE)
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
 
     def test_user_exit_127_is_report_not_executor_error(self):
         # 提交程序自己 exit 127 属于提交事实：报告里带 exit_code=127，
-        # 判为 RE；不能与启动失败（SYSTEM_ERROR）混同。
+        # 判为 RE；不能与启动失败（SE）混同。
         with tempfile.TemporaryDirectory(prefix="executor-test-") as directory:
             root = Path(directory)
             (root / "in").write_text("1\n")
@@ -369,7 +369,7 @@ class NoCgroupRunnerTests(ExecutionTestsMixin, unittest.TestCase):
             [sys.executable, "-c", "print('must not run')"], self.input, self.output,
             cgroup_root=self.root / "missing-cgroup", drop_privileges=False,
         )
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
         self.assertFalse(self.output.exists())
 
     def test_disabled_cgroup_is_not_accessed_and_rss_does_not_cause_mle(self):
@@ -381,10 +381,9 @@ class NoCgroupRunnerTests(ExecutionTestsMixin, unittest.TestCase):
         )
         self.assertEqual(result.verdict, Verdict.OK, result.message)
         self.assertGreater(result.rss_kb, 1024)
-        self.assertEqual(result.memory_peak_bytes, 0)
+        # 无 cgroup 时内存统计未测量，用 None 表达；不能用 0 冒充“真的用量 0”。
+        self.assertIsNone(result.memory)
         self.assertEqual(result.memory_kb, 0)
-        self.assertEqual(result.oom_events, 0)
-        self.assertEqual(result.oom_kills, 0)
 
 
 class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
@@ -428,8 +427,8 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
         result = self.run_python("a = bytearray(512 * 1024 * 1024)",
                                  Limits(memory_kb=32 * 1024))
         self.assertEqual(result.verdict, Verdict.MLE, result.message)
-        self.assertGreater(result.oom_events, 0)
-        self.assertGreater(result.oom_kills, 0)
+        self.assertGreater(result.memory.oom_events, 0)
+        self.assertGreater(result.memory.oom_kills, 0)
         self.assertEqual(result.signal, signal.SIGKILL)
 
     def test_memory_margin_allows_finish_before_judging(self):
@@ -439,13 +438,13 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
         self.assertEqual(result.verdict, Verdict.MLE, result.message)
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.signal, 0)
-        self.assertEqual(result.oom_events, 0)
-        self.assertGreater(result.memory_peak_bytes, 8 * 1024 * 1024)
-        self.assertLess(result.memory_peak_bytes, 24 * 1024 * 1024)
+        self.assertEqual(result.memory.oom_events, 0)
+        self.assertGreater(result.memory.peak_bytes, 8 * 1024 * 1024)
+        self.assertLess(result.memory.peak_bytes, 24 * 1024 * 1024)
 
     def test_unavailable_cgroup_is_system_error(self):
         result = self.run_python("pass", cgroup_root=self.root / "no-cgroup")
-        self.assertEqual(result.verdict, Verdict.SYSTEM_ERROR)
+        self.assertEqual(result.verdict, Verdict.SE)
 
     def test_cleanup_includes_detached_descendants(self):
         pidfile = self.root / "detached.pid"
@@ -465,8 +464,8 @@ class RunnerTests(ExecutionTestsMixin, unittest.TestCase):
         )
         self.assertEqual(result.verdict, Verdict.MLE, result.message)
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(result.oom_events, 0)
-        self.assertGreaterEqual(result.memory_peak_bytes, 24 * 1024 * 1024)
+        self.assertEqual(result.memory.oom_events, 0)
+        self.assertGreaterEqual(result.memory.peak_bytes, 24 * 1024 * 1024)
 
 
 
