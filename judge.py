@@ -17,7 +17,7 @@
 3. 比对：优先用 `/judge/checker/fcmp2`，否则按行比较，忽略行尾空白和末尾空行
    —— 与 judge_server 的 fallback 路径同一套规则。
 
-限制与判定口径（原 runner.py 的实现）也已并入本文件；它不替代服务端判题，
+限制计算与判定规则（classify_execution）也在本文件；它不替代服务端判题，
 详细差异见本目录 README.md 的“与 judge_server 的差异”一节。
 
 执行顺序
@@ -59,8 +59,8 @@ from typing import Dict, Optional
 # 同目录导入：允许直接 `python3 judge.py` 而不需要安装成包。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# 编译和比对留在 CLI；执行、统计与判定的实现（原 runner.py）也已并入本文件。
-# 这里不再有第二个 Python 执行入口：judge 是唯一的 CLI，executor 是唯一的 C 侧。
+# judge 是唯一的 Python 入口：环境准备、编译、测试点事务、判定与汇总都在这里。
+# 底层的进程执行由独立的 C executor 完成，本文件不实现第二套执行器。
 from memory_cgroup import MemoryCgroup
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -444,7 +444,7 @@ def run_delegated(raw_args: list[str]) -> int:
 
 
 # --------------------------------------------------------------------------
-# 执行、统计与判定（原 runner.py 并入本文件）
+# 限制、执行适配与判定（judge 的职责）
 #
 # 一次 judge_case() 的职责分段：限制口径 → 校验 → 固定路径 → 身份 → cgroup 生命
 # 周期 → 启动 executor → 收尾统计 → 判定 → 报告结果。判定和限制计算属于
@@ -719,7 +719,11 @@ class ProtectionLimits:
     """
 
     cpu_seconds: int
-    """CPU hard limit 秒数（阈值 + CPU 余量后向上取整）。"""
+    """CPU soft limit 秒数（题目阈值 + CPU 余量后向上取整）。
+
+    写入 RLIMIT_CPU 的 rlim_cur；executor 会把 rlim_max 再设高 1 秒，
+    所以 hard limit 比本值多一秒（默认：soft 2s / hard 3s）。
+    """
 
     memory_max_bytes: int
     """cgroup memory.max 字节数（阈值 + 内存余量）；0 表示不设。"""

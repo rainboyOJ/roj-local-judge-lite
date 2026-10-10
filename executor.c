@@ -102,7 +102,7 @@ static unsigned long long parse_number(const char *text) {
 
 static struct Options parse_options(int argc, char **argv) {
   if (argc < 15) {
-    fprintf(stderr, "executor must be invoked by runner.py\n");
+    fprintf(stderr, "executor: missing required execution arguments\n");
     exit(125);
   }
   unsigned long long drop = parse_number(argv[7]);
