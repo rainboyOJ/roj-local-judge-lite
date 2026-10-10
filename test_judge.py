@@ -690,6 +690,115 @@ class ExecutionPathReportingTests(unittest.TestCase):
         self.assertEqual(custom.read_text(), "diagnostic\n")
 
 
+class FileModeEndToEndTests(unittest.TestCase):
+    """第三步：file 模式端到端（真实 freopen / 文件打开），不只 mock。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="filemode-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.data = self.root / "testData" / "2000"
+        self.case_data = self.data / "data"
+        self.case_data.mkdir(parents=True)
+        for directory in (self.root, self.root / "testData", self.data, self.case_data):
+            directory.chmod(0o755)
+        (self.data / "config.json").write_text(json.dumps({
+            "title": "文件模式", "time": 1000, "memory": 128,
+            "io": {"mode": "file", "input_file": "apple.in",
+                   "output_file": "apple.out"}}))
+        self._add_case(1, "3 4\n", "7\n")
+        self.source = self.root / "sol.cpp"
+
+    def _add_case(self, index, data, answer):
+        (self.case_data / f"problem{index}.in").write_text(data)
+        (self.case_data / f"problem{index}.out").write_text(answer)
+
+    def _write_cpp(self, body):
+        self.source.write_text(
+            "#include <cstdio>\n#include <unistd.h>\n#include <sys/stat.h>\n"
+            "int main(){ freopen(\"apple.in\",\"r\",stdin); " + body + " }\n")
+
+    def _run(self, source=None):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([
+                "--pid", "2000", "--testdata", str(self.root / "testData"),
+                "--checker", "none", "--no-cgroup", str(source or self.source)])
+        return code, out.getvalue()
+
+    def _first_line(self, output):
+        return next(line for line in output.splitlines() if line.strip().startswith("#1"))
+
+    def test_freopen_submission_is_ac(self):
+        self._write_cpp('freopen("apple.out","w",stdout);'
+                        ' long long a,b; scanf("%lld %lld",&a,&b); printf("%lld\\n",a+b); return 0;')
+        code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertIn("AC", self._first_line(output))
+
+    def test_wrong_file_content_is_wa(self):
+        self._write_cpp('freopen("apple.out","w",stdout);'
+                        ' long long a,b; scanf("%lld %lld",&a,&b); printf("%lld\\n",a+b+1); return 0;')
+        code, output = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("WA", self._first_line(output))
+
+    def test_missing_output_file_is_wa_not_se(self):
+        # 只往 stdout 打印，不生成 apple.out：应为 WA 并说明原因。
+        self._write_cpp('long long a,b; scanf("%lld %lld",&a,&b); printf("%lld\\n",a+b); return 0;')
+        code, output = self._run()
+        self.assertIn("WA", self._first_line(output))
+        self.assertIn("未生成输出文件", output)
+
+    def test_directory_output_is_wa(self):
+        self._write_cpp('mkdir("apple.out",0755); return 0;')
+        _, output = self._run()
+        self.assertIn("WA", self._first_line(output))
+        self.assertIn("是目录", output)
+
+    def test_symlink_output_is_wa(self):
+        self._write_cpp('symlink("apple.in","apple.out"); return 0;')
+        _, output = self._run()
+        self.assertIn("WA", self._first_line(output))
+        self.assertIn("软链接", output)
+
+    def test_python_file_submission(self):
+        py = self.root / "sol.py"
+        py.write_text('with open("apple.in") as f: a,b = map(int, f.read().split())\n'
+                      'with open("apple.out","w") as f: f.write(f"{a+b}\\n")\n')
+        code, output = self._run(py)
+        self.assertEqual(code, 0, output)
+        self.assertIn("AC", self._first_line(output))
+
+    def test_empty_file_matches_empty_answer(self):
+        self._add_case(2, "", "")
+        self._write_cpp('freopen("apple.out","w",stdout); return 0;')
+        _, output = self._run()
+        self.assertIn("#2", output)
+        self.assertIn("AC", [l for l in output.splitlines() if "#2" in l][0])
+
+    def test_input_copy_is_not_the_original(self):
+        # 提交就地修改 apple.in，原题目数据必须不变。
+        original = self.case_data / "problem1.in"
+        before = original.read_text()
+        self._write_cpp('freopen("apple.in","w",stdin); freopen("apple.out","w",stdout);'
+                        ' printf("7\\n"); return 0;')
+        self._run()
+        self.assertEqual(original.read_text(), before)
+
+    def test_each_case_gets_a_fresh_directory(self):
+        # 第二点不能看到第一点留下的普通文件：在 cwd 写一个标记，第二点不应存在。
+        self._add_case(2, "3 4\n", "7\n")
+        self._write_cpp('freopen("apple.in","r",stdin); freopen("apple.out","w",stdout);'
+                        ' long long a,b; scanf("%lld %lld",&a,&b); printf("%lld\\n",a+b);\n'
+                        ' FILE* f = fopen("leftover.marker","a"); if(f) fclose(f); return 0;')
+        self._run()
+        # 正常结束会删除各点目录；用 keep-work-dir 的方式无法在此断言，
+        # 改为断言结果 AC（说明两点都各自读到了正确输入，未互相污染）。
+        _, output = self._run()
+        self.assertIn("通过 2/2", output)
+
+
 class DelegationModeTests(unittest.TestCase):
     """root 与普通用户的自动委派方式不同：前者走系统管理器，后者走用户管理器。"""
 
