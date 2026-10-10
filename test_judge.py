@@ -14,7 +14,7 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 import judge
-from judge import (ExecutionReport, Limits, MemoryResult, ProtectionLimits, Verdict,
+from judge import (ExecutionReport, ExecutorError, Limits, MemoryResult, ProtectionLimits, Verdict,
                    classify_execution, judge_case, make_protection_limits, run_case)
 
 
@@ -198,6 +198,113 @@ class BundledTestDataTests(unittest.TestCase):
             (own / "problem1.out").write_text("1\n")
             root, _ = judge.resolve_testdata(None)
             self.assertEqual(root, directory / "testData")
+
+
+class CleanupSemanticsTests(unittest.TestCase):
+    """R1：清理失败不能吞掉取消或执行原因（异常组合矩阵）。
+
+    直接构造一个已完成 __enter__ 的 MemoryCgroup（不依赖真实内核），
+    再注入 stop/rmdir 失败，验证 __exit__ 的异常传播语义。
+    不破坏系统 cgroup。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cleanup-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "cgroup.subtree_control").write_text("memory\n")
+
+    def _with_entered(self, *, stop_fails=False, keep_dir=False):
+        """把 MemoryCgroup.__enter__ 换成“已进入”版本的上下文管理器。
+
+        不伪造真实内核接口，只构造出 __exit__ 需要的状态：
+        一个已创建的目录、可替换的 stop()。不破坏系统 cgroup。
+        """
+        from memory_cgroup import MemoryCgroup
+        gc = MemoryCgroup(self.root, 0)
+
+        def fake_enter(self):
+            self.path.mkdir()
+            if keep_dir:
+                (self.path / "keep").write_text("x")  # 非空，rmdir 必失败
+            if stop_fails:
+                def boom():
+                    raise OSError("stop failed")
+                self.stop = boom
+            else:
+                self.stop = lambda: None
+            return self
+
+        # with 语句走 type(gc).__enter__，必须补到类上才能生效。
+        patcher = patch.object(MemoryCgroup, "__enter__", fake_enter)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return gc
+
+    def test_no_original_exception_cleanup_failure_propagates(self):
+        gc = self._with_entered(stop_fails=True)
+        with self.assertRaises(OSError) as ctx:
+            with gc:
+                pass
+        self.assertIn("stop failed", str(ctx.exception))
+
+    def test_original_executor_error_survives_cleanup_failure(self):
+        gc = self._with_entered(stop_fails=True)
+        with self.assertRaises(ExecutorError) as ctx:
+            with gc:
+                raise ExecutorError("original execution failure")
+        self.assertIn("original execution failure", str(ctx.exception))
+        notes = getattr(ctx.exception, "cleanup_notes", [])
+        self.assertTrue(any("stop failed" in n for n in notes))
+
+    def test_keyboard_interrupt_survives_cleanup_failure(self):
+        gc = self._with_entered(stop_fails=True)
+        with self.assertRaises(KeyboardInterrupt) as ctx:
+            with gc:
+                raise KeyboardInterrupt()
+        notes = getattr(ctx.exception, "cleanup_notes", [])
+        self.assertTrue(any("stop failed" in n for n in notes))
+
+    def test_rmdir_failure_after_stop_is_attached(self):
+        gc = self._with_entered(keep_dir=True)
+        with self.assertRaises(ExecutorError) as ctx:
+            with gc:
+                raise ExecutorError("exec failed")
+        self.assertIn("exec failed", str(ctx.exception))
+        self.assertTrue(getattr(ctx.exception, "cleanup_notes", []))
+
+    def test_healthy_cleanup_does_not_interfere(self):
+        # 正常清理：无异常时 __exit__ 不抛，目录被删除。
+        gc = self._with_entered()
+        with gc:
+            pass
+        self.assertFalse(gc.path.exists())
+
+    def test_enter_rollback_failure_keeps_original_reason(self):
+        # 预检失败（缺少 memory.peak）→ __enter__ 抛 OSError并回滚；
+        # 再让 rmdir 失败，原始原因仍必须可见。
+        from memory_cgroup import MemoryCgroup
+        gc = MemoryCgroup(self.root, 0)
+        original_mkdir = Path.mkdir
+
+        def tracking_mkdir(path_self, *a, **kw):
+            original_mkdir(path_self, *a, **kw)
+            if path_self == gc.path:
+                (gc.path / "keep").write_text("x")  # 让回滚 rmdir 失败
+
+        with patch.object(Path, "mkdir", tracking_mkdir):
+            with self.assertRaises(OSError) as ctx:
+                with gc:
+                    pass
+        self.assertIn("cgroup 接口", str(ctx.exception))
+
+    def test_describe_failure_combines_both_reasons(self):
+        exc = ExecutorError("exec failed")
+        exc.cleanup_notes = ["stop failed", "rmdir failed"]
+        message = judge._describe_failure(exc)
+        self.assertIn("exec failed", message)
+        self.assertIn("stop failed", message)
+        self.assertIn("rmdir failed", message)
 
 
 class DelegationModeTests(unittest.TestCase):

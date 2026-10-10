@@ -776,6 +776,19 @@ def _check_stream_paths(*paths: Path) -> None:
                 raise ValueError("stdin、stdout、stderr 必须使用不同的文件")
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """把基础设施故障和附带的清理诊断合成一条可读消息。
+
+    MemoryCgroup 在清理失败时不会另抛异常，而是把诊断挂到原始异常上
+    （cleanup_notes）；这里把它们一起呈现，避免清理错误掩盖执行原因。
+    """
+    message = str(exc)
+    notes = getattr(exc, "cleanup_notes", None) or []
+    if notes:
+        message += "；清理失败：" + "；".join(notes)
+    return message
+
+
 def run_case(
     argv: list[str],
     input_path: Path,
@@ -860,8 +873,13 @@ def run_case(
         # 两种模式都按同一规则判定。没有 cgroup 就没有内存超限证据，
         # 不拿 rss_kb 补位，也不根据用户 stderr 中的 MemoryError 猜 MLE。
         result.verdict, result.message = classify_execution(report, memory, limits)
+    except KeyboardInterrupt:
+        # 取消不被吸收：停止整次评测，由顶层给出退出码 130。
+        # 清理失败已作为诊断挂在异常上（见 MemoryCgroup.__exit__）。
+        raise
     except (OSError, ExecutorError) as exc:
-        result = CaseResult(message=str(exc))
+        # 基础设施故障映射为 SE。若同时有清理失败，两份诊断都保留。
+        result = CaseResult(message=_describe_failure(exc))
 
     result.output_path = str(output_path)
     result.stderr_path = str(stderr_path)

@@ -15,6 +15,22 @@ def read_counters(path: Path) -> dict[str, int]:
             (line.split() for line in path.read_text().splitlines())}
 
 
+def _attach_cleanup_note(exc: BaseException, cleanup_error: OSError) -> None:
+    """把清理失败诊断挂到正在传播的异常上（Python 3.8 没有 add_note）。
+
+    judge 在把异常转成 SE 时读取本属性，就能同时展示执行原因与清理原因。
+    多条清理失败累加，不覆盖。
+    """
+    notes = getattr(exc, "cleanup_notes", None)
+    if notes is None:
+        notes = []
+        try:
+            exc.cleanup_notes = notes
+        except AttributeError:  # 极少数异常禁止设属性；退化为不附加。
+            return
+    notes.append(str(cleanup_error))
+
+
 class MemoryCgroup:
     def __init__(self, root: Path, max_bytes: int):
         self.root = root
@@ -35,8 +51,12 @@ class MemoryCgroup:
             for name in ("memory.peak", "memory.events", "cgroup.kill"):
                 if not (self.path / name).exists():
                     raise OSError(f"内核缺少 cgroup 接口 {name}")
-        except BaseException:
-            self.path.rmdir()
+        except BaseException as exc:
+            # 回滚失败不能掩盖原始原因：原始异常继续传播，回滚诊断附加其上。
+            try:
+                self.path.rmdir()
+            except OSError as rollback_error:
+                _attach_cleanup_note(exc, rollback_error)
             raise
         return self
 
@@ -65,6 +85,25 @@ class MemoryCgroup:
         }
 
     def __exit__(self, exc_type, exc, traceback):
-        # 正常、setup 失败、Ctrl+C、helper 故障都必须经过这里。
-        self.stop()
-        self.path.rmdir()
+        # 正常、setup 失败、Ctrl+C、executor 故障都必须经过这里。
+        #
+        # 关键约定：清理失败不能吞掉正在传播的异常。
+        #  - 无原始异常：把清理错误直接抛出，由调用方映射为 SE。
+        #  - 有原始异常（含 KeyboardInterrupt）：保留原异常继续传播，
+        #    把清理诊断附加到它上面（注意保持取消语义），不另抛新异常。
+        # Python 3.8 没有 add_note()，用自定义属性附加诊断。
+        try:
+            self.stop()
+        except OSError as cleanup_error:
+            if exc is not None:
+                _attach_cleanup_note(exc, cleanup_error)
+                return False  # 让原异常继续传播
+            raise
+        try:
+            self.path.rmdir()
+        except OSError as cleanup_error:
+            if exc is not None:
+                _attach_cleanup_note(exc, cleanup_error)
+                return False
+            raise
+        return False
