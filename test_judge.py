@@ -509,12 +509,20 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="workdir-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # root 会降权到 nobody 运行提交；临时目录和输入必须对降权后的
+        # 身份可读，与真实评测场景一致（题目数据本来就是可读的）。
+        self.root.chmod(0o755)
         self.source = self.root / "sum.py"
         self.source.write_text("print(3)\n")
+        self.source.chmod(0o644)
         self.data = self.root / "testData" / "1000" / "data"
         self.data.mkdir(parents=True)
+        for directory in (self.root / "testData", self.root / "testData" / "1000", self.data):
+            directory.chmod(0o755)
         (self.data / "problem1.in").write_text("1\n")
         (self.data / "problem1.out").write_text("3\n")
+        for case_file in self.data.iterdir():
+            case_file.chmod(0o644)
         self.cases = [("problem1", self.data / "problem1.in",
                        self.data / "problem1.out")]
 
