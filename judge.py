@@ -1361,6 +1361,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("IO 标准流模式")
     if isolated:
         print(f"执行 cgroup 隔离，root={cgroup_root}")
+        # 不降权时提交与 judge 同身份，可以写自己 case 组的 memory.max。
+        # 这在本地自查里无所谓，但要让人知道 MLE 不是防篡改的。
+        if not case_io.resolve_drop_privileges(None, 65534) and os.geteuid() != 0:
+            print("  ⚠ 未降权：提交与 judge 同身份，可修改自己的 cgroup 限制；MLE 不可防篡改")
     else:
         print(f"执行降级模式：{reason}")
         if os.geteuid() == 0:

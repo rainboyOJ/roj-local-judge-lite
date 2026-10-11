@@ -2,6 +2,11 @@
 
 调用者提供已经委派且启用 memory controller 的父目录。本模块只操作自己创建的
 随机子目录，不修改系统其他 cgroup。内存计量包含进程树、文件缓存和部分内核内存。
+
+信任边界：这些接口文件的属主是创建组的进程（judge），模式 0644。程序降权
+（root 默认降到 nobody）后只是 other 位，改不了自己的 case 组；若程序与 judge
+同身份运行（普通用户默认、或 --no-drop-privileges），它就能写 memory.max 把
+上限抹成 max，MLE 从此判不出来。这是本地自查工具的已知限制，不是防篡改机制。
 """
 from __future__ import annotations
 

@@ -391,6 +391,36 @@ root 默认设置重定向及限制后降权至 nobody（UID/GID 65534），清�
 普通用户默认不降权。可用 `--uid`、`--gid`、`--no-drop-privileges` 控制。
 降权后的用户必须能访问 cwd 和可执行文件。默认最小环境，`--inherit-env` 才继承全部环境。
 
+### 内存隔离的信任边界
+
+cgroup 的限制不是防篡改的：**降权后程序改不了自己的 case 组，同身份运行能改**。
+
+实测一个提交去写自己的 `case-*/memory.max`：
+
+| 运行方式 | 程序身份 | 结果 |
+| --- | --- | --- |
+| root（默认降权） | nobody (65534) | `open(...memory.max, O_WRONLY)` → `Permission denied` |
+| 普通用户（默认不降权） | 与 judge 相同 | 写入成功，可把上限改成 `max` |
+
+原因是这些接口文件的属主是**创建组的进程**（也就是 judge），模式是 `0644`。
+降权后程序落在 other 位，只能读；同身份时它是属主，可以写。
+
+这意味着：
+
+- **root 默认路径（降权到 nobody）下，提交无法放宽自己的内存限制**，MLE 可信。
+- **普通用户默认路径或 `--no-drop-privileges` 下，提交能把自己的 `memory.max` 改成
+  `max`，之后不会再触发 OOM，MLE 也就永远判不出来。** 它还能改 `memory.swap.max`、
+  `memory.oom.group` 等接口来改变内核行为。
+
+部分行为仍然拦得住：`memory.peak` 是历史最大值、`memory.events` 的 `oom`/`oom_kill`
+是单调计数，改小上限不影响已记录的事实；把进程移出 case 组需要有祖先组的写权限，
+实测 `/sys/fs/cgroup/cgroup.procs` 对同身份用户也是 `Permission denied`。
+
+这不影响本工具的定位：它是本地自查，不是在线判题机——不依赖它对抗恶意提交。
+要真正隔离，需要 cgroup namespace（把 `/sys/fs/cgroup` 视图限制在程序自己的组内），
+这不在当前实现范围内。需要可信计时与内存时，用 root 路径让它降权，或部署到
+judge_server。
+
 ## 结果与分类
 
 ```json
