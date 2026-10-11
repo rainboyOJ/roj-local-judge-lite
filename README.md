@@ -27,7 +27,11 @@ AC / WA / TLE / MLE / RE 结论。
   - [工作目录布局](#工作目录布局)
 - [judge.py 独立使用说明](#judgepy-独立使用说明)
   - [基本用法](#基本用法)
+  - [临时评测：只有一组数据，没有题目编号](#临时评测只有一组数据没有题目编号)
+  - [只评测一个（或几个）数据点](#只评测一个或几个数据点)
+  - [给程序AI 读的输出（--output-format json）](#给程序ai-读的输出--output-format-json)
   - [judge.py 执行逻辑](#judgepy-执行逻辑)
+- [用 npx 安装配套的 AI skill](#用-npx-安装配套的-ai-skill)
 - [安装脚本](#安装脚本)
 - [其他参数](#其他参数)
 - [验证](#验证)
@@ -710,6 +714,30 @@ python3 judge.py --pid 1000 --data-dir data --output-format json sol.cpp \
 root 运行时同样默认降权到 nobody，需保证源文件、可执行文件和工作目录可访问。
 
 退出码：`0` 全部 AC，`1` 有非 AC 结果，`2` 编译失败或工具/环境错误。
+
+## 用 npx 安装配套的 AI skill
+
+仓库自带一份给 AI 用的 skill（`.agents/skills/roj-local-judge/`），说明怎么调用本工具评测。
+[vercel-labs 的 skills 工具](https://github.com/vercel-labs/agent-skills) 可以直接从本仓库安装：
+
+```bash
+npx skills add rainboyOJ/roj-local-judge-lite
+```
+
+它会克隆仓库、发现 `roj-local-judge`、把 `SKILL.md` 装到当前项目的 `.agents/skills/`，
+并写入 `skills-lock.json` 记录来源与哈希。常用变体：
+
+```bash
+npx skills add rainboyOJ/roj-local-judge-lite --list   # 只列出仓库里有哪些 skill，不安装
+npx skills add rainboyOJ/roj-local-judge-lite -g       # 装到用户级，而不是当前项目
+npx skills add rainboyOJ/roj-local-judge-lite -s roj-local-judge -y   # 指定 skill 名并跳过确认
+```
+
+装好后 skill 会自动出现在受支持的 agent 里（Codex、Claude Code、Cursor、Cline 等）；
+也可以直接复制 `.agents/skills/roj-local-judge/` 到你的 skills 目录，效果相同。
+
+注意：安装的是**用法文档**；评测本身仍需要本仓库的 `judge.py` 和构建好的 `executor`
+（见上面的「快速使用」与「构建与权限」）。
 
 ## 安装脚本
 

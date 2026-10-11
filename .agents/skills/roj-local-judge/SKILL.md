@@ -1,6 +1,6 @@
 ---
 name: roj-local-judge
-description: 本地评测一份 C++/Python 提交：编译、跑测试点、cgroup 计量内存，给出 AC/WA/TLE/MLE/RE/SE。当用户要求“评测/测一下这段代码”“跑一下测试点”“看看能不能过”“本地验证一下这个解法”“这题我的程序对不对”时使用。也覆盖从 new_ROJ 的题目目录、rbook 的 roj-data 目录取测试数据。不要用于在线提交、远程判题或造题。
+description: 本地评测一份 C++/Python 提交：编译、跑测试点、cgroup 计量内存，给出 AC/WA/TLE/MLE/RE/SE。当用户要求“评测/测一下这段代码”“跑一下测试点”“看看能不能过”“本地验证一下这个解法”“这题我的程序对不对”时使用。不要用于在线提交、远程判题或造题。
 compatibility: 需要 Linux、Python 3.8+、make 和一个 C 编译器（首次要构建 executor）。cgroup 内存计量可选：不可用时自动降级为只限 CPU 与 wall，此时 MLE 判不出来。
 ---
 
@@ -50,7 +50,7 @@ python3 judge.py sol.cpp --case tests/a.in
 python3 judge.py sol.cpp --case a.in --case b.in --case-out a.exp --case-out b.exp
 
 # 题库布局
-python3 judge.py 1000.cpp --pid 1000 --testdata /home/rainboy/mycode/roj-local-judge-lite/testData
+python3 judge.py 1000.cpp --pid 1000 --testdata /path/to/testData
 
 # 先看看有哪些题
 python3 judge.py --list --testdata /path/to/testData
@@ -138,48 +138,3 @@ python3 judge.py sol.cpp --data-dir data --output-format json \
 --keep-work-dir                 # 保留临时目录，便于看输出与编译日志
 --lang cpp|python|auto          # 默认按后缀判断
 ```
-
-## 数据从哪来（与其它项目的衔接）
-
-**`rbook_new_problem_solutions`：数据已就绪，可直接评测。**
-
-该仓库的 `roj-data/<pid>/data/data/` 下是解压好的 `.in`/`.out`（注意是两层 `data`）：
-
-```sh
-# 先确认目录里有 .in/.out，再把它交给 --data-dir
-ls /home/rainboy/mycode/rbook_new_problem_solutions/roj-data/20023/data/data/*.in
-python3 judge.py sol.cpp --data-dir /home/rainboy/mycode/rbook_new_problem_solutions/roj-data/20023/data/data
-```
-
-`roj-data/<pid>/` 下通常还有 `.tar.zst` 归档；拿去评测的是**含 `.in`/`.out` 的那层目录**。
-路径层级可能因下载方式而不同，用 `find <dir> -name '*.in' | head` 先确认再传。
-
-**`new_ROJ`：数据需要先生成，`problems/<pid>/` 里没有现成的 `data/`。**
-
-`problems/<pid>/` 含 `config.json`、`std.cpp`、`data.py`（CYaRon 生成器）、`data.json`（文件清单）。
-评测前需要先跑生成器产出 `problem*.in` / `problem*.out`，再用 `--data-dir` 或 `--case` 喂进来。
-生成步骤不属于本 skill，见 `new_ROJ/.agents/skills/add-roj-problem`。
-
-**本仓库自带的示例题**（不需要额外准备数据）：
-
-```sh
-python3 judge.py --pid 1000 --testdata /home/rainboy/mycode/roj-local-judge-lite/testData --keep-work-dir testData/1000/std.cpp
-```
-
-## 与 `roj.py test` 的分工
-
-`new_ROJ/.agents/skills/roj/scripts/roj.py` 也带一个 `test` 子命令：它用 `g++ -std=c++17 -O2`
-编译、`diff -b` 比对，**没有 cgroup**。
-
-| 需求 | 用哪个 |
-| --- | --- |
-| 快速看一份代码能不能过（只要 AC/WA/RE） | 两者都行，`roj.py test` 更轻 |
-| **需要内存计量与 MLE 判定** | **本程序**（`roj.py test` 只报告不限制内存） |
-| **需要 file 模式**（`freopen` 读写文件） | **本程序** |
-| 需要 cgroup 隔离 / 与 judge_server 一致的限额口径 | **本程序** |
-| 想从网上边下数据边测 | `roj.py test --download`（本程序不做网络） |
-| 想直接读 new_ROJ 目录里的题 | `roj.py test 1000` 会自己找 `data/` |
-
-两者都有 JSON 输出：`roj.py --json test ...` 和本程序的 `--output-format json`。
-
-一句话：**要内存判定、文件模式、cgroup 隔离就用本程序；只想快速看个 AC/WA，或者要从网上拉数据，用 `roj.py test` 更顺手。**
