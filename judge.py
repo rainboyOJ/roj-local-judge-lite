@@ -961,6 +961,31 @@ def list_problems(testdata_root: Path, tried: list[Path]) -> int:
 # --------------------------------------------------------------------------
 
 
+def locate_problem(args, testdata_root: Optional[Path], tried: list[Path]
+                   ) -> tuple[Optional[Path], Optional[Path], int, bool]:
+    """定位测试点目录与题目目录，返回 (data_dir, problem_dir, 退出码, 是否临时)。
+
+    两种来源，互斥：
+      --data-dir D   直接用 D；题目目录取 D 的父目录（config.json 与 file
+                     模式的提交文件都在那里），不需要 pid 与 testData。
+      --pid N        在 testData 根目录下拼出 X/N/data 与 X/N。
+
+    返回的退出码：成功为 0；已打印错误时为非零，调用方直接返回即可。
+    """
+    if args.data_dir is not None:
+        data_dir = args.data_dir.resolve()
+        if not data_dir.is_dir():
+            print(f"找不到测试点目录：{data_dir}", file=sys.stderr)
+            return None, None, 2, True
+        return data_dir, data_dir.parent, 0, True
+
+    # 查找失败会返回 None；先给出尝试过的目录，再退出，不能直接拼接题号。
+    if testdata_root is None:
+        return None, None, report_missing_testdata(tried), False
+    problem_dir = testdata_root / args.pid
+    return problem_dir / "data", problem_dir, 0, False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="judge.py",
@@ -970,9 +995,13 @@ def build_parser() -> argparse.ArgumentParser:
   python3 judge.py --pid 1000 solution.cpp
   python3 judge.py --list
   python3 judge.py --pid 1000 solution.py --time 2000 --memory 256
+  python3 judge.py solution.cpp --data-dir ./data --time 2000   # 临时评测
 """)
     parser.add_argument("source", nargs="?", type=Path, help="提交源文件（.cpp 或 .py）")
     parser.add_argument("--pid", help="题目编号，对应 testData/<pid>/")
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="直接指定测试点目录（含配对的 .in/.out），跳过 --pid/--testdata；"
+                             "附近的 config.json 仍会被读取")
     parser.add_argument("--lang", choices=("auto", "cpp", "python"), default="auto",
                         help="提交语言，默认按后缀判断")
     parser.add_argument("--testdata", type=Path, default=None,
@@ -994,6 +1023,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="保留临时工作目录，便于查看输出和编译日志")
     parser.add_argument("--list", action="store_true", help="列出 testData 下可用的题目后退出")
     return parser
+
+
+def check_argument_combinations(parser: argparse.ArgumentParser, args) -> None:
+    """拒绝互相矛盾的参数组合；在解析之后、做任何事之前调用。"""
+    if args.data_dir is not None and args.pid:
+        parser.error("--data-dir 与 --pid 只能选一个：前者直接指定目录，后者从 --testdata 下拼题号")
+    if args.data_dir is not None and args.testdata is not None:
+        parser.error("--data-dir 已经指定了测试点目录，不再需要 --testdata")
+    if args.data_dir is not None and args.list:
+        parser.error("--list 用于列出 --testdata 下的题目，与 --data-dir 不兼容")
 
 
 def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
@@ -1273,6 +1312,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    check_argument_combinations(parser, args)
 
     # ── `--in-scope`：在 systemd-run 建立的 scope 里准备委派父目录，然后继续 ──
     #    不再 exec 第二个自己：当前进程就是要跑评测的那个，准备只是前置步骤。
@@ -1282,12 +1322,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             return code
 
     # ── step 02 · 解析参数、定位测试数据、读题目限制 ──────────────────────
-    testdata_root, tried = resolve_testdata(args.testdata)
     if args.list:
+        testdata_root, tried = resolve_testdata(args.testdata)
         return list_problems(testdata_root, tried) if testdata_root else report_missing_testdata(tried)
 
-    if not args.pid:
-        parser.error("请用 --pid 指定题目编号，或先用 --list 查看可用题目")
     if args.source is None:
         parser.error("请提供提交源文件，例如：python3 judge.py --pid 1000 solution.cpp")
 
@@ -1300,22 +1338,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(error, file=sys.stderr)
         return 2
 
-    # 查找失败会返回 None；先给出尝试过的目录，再退出，不能直接拼接题号。
-    if testdata_root is None:
-        return report_missing_testdata(tried)
-
-    problem_dir = testdata_root / args.pid
-    data_dir = problem_dir / "data"
+    # 两种定位方式互斥；都没给时报错并提示两种用法。
+    if args.data_dir is None and not args.pid:
+        parser.error("请用 --pid 指定题目编号（配合 --testdata），"
+                     "或直接用 --data-dir 指定测试点目录")
+    testdata_root, tried = (resolve_testdata(args.testdata) if args.data_dir is None
+                            else (None, []))
+    data_dir, problem_dir, code, temporary = locate_problem(args, testdata_root, tried)
+    if code != 0:
+        return code
     if not data_dir.is_dir():
         print(f"找不到测试数据：{data_dir}", file=sys.stderr)
         print(f"可用题目：{', '.join(p.name for p in sorted(testdata_root.iterdir()))}"
-              if testdata_root.is_dir() else "", file=sys.stderr)
+              if testdata_root is not None and testdata_root.is_dir() else "", file=sys.stderr)
         return 2
     cases = load_cases(data_dir)
     if not cases:
         print(f"{data_dir} 下没有配对的 .in/.out 测试点", file=sys.stderr)
         return 2
 
+    has_config = (problem_dir / "config.json").is_file()
     title, time_ms, memory_mb = "", 1000, 128
     try:
         title, time_ms, memory_mb, io_config = load_problem_config(problem_dir)
@@ -1352,7 +1394,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         reason = f"{reason}；自动委派不可用（{delegate_reason}）"
 
-    print(f"题目 {args.pid}" + (f"  {title}" if title else ""))
+    if temporary:
+        # 临时评测：没有 pid，题目名就用目录名；无 config.json 时用默认限制。
+        label = problem_dir.name or str(problem_dir)
+        print(f"题目 {label}（临时：{data_dir}）" + (f"  {title}" if title else ""))
+        if not has_config:
+            print(f"  未找到 {problem_dir / 'config.json'}，使用默认限制（可用 --time/--memory 覆盖）")
+    else:
+        print(f"题目 {args.pid}" + (f"  {title}" if title else ""))
     print(f"提交 {source.name}（{lang}）")
     print(f"限制 CPU {time_ms}ms / 内存 {memory_mb}MiB / wall {limits.resolved_wall_ms()}ms")
     if io_config.is_file_mode:

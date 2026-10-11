@@ -187,6 +187,111 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(verdict, Verdict.OK)
 
 
+class DataDirModeTests(unittest.TestCase):
+    """--data-dir：直接指定测试点目录，不需要 pid/testData/config.json。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="datadir-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "t1.in").write_text("1 2\n")
+        (self.data / "t1.out").write_text("3\n")
+        (self.data / "t2.in").write_text("10 20\n")
+        (self.data / "t2.out").write_text("30\n")
+        self.source = self.root / "main.cpp"
+        self.source.write_text(
+            "#include <cstdio>\nint main(){long long a,b;"
+            "if(scanf(\"%lld %lld\",&a,&b)!=2)return 1;"
+            "printf(\"%lld\\n\",a+b);return 0;}\n")
+
+    def _run(self, *extra):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([str(self.source), "--data-dir", str(self.data),
+                               "--no-cgroup", *extra])
+        return code, out.getvalue()
+
+    def test_temporary_problem_needs_no_pid_or_config(self):
+        code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertIn("通过 2/2", output)
+        self.assertIn("临时", output)
+        # 没有 config.json 时明确告知用了默认值。
+        self.assertIn("使用默认限制", output)
+
+    def test_config_next_to_data_is_read(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"title": "临时题", "time": 2000, "memory": 256}))
+        code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertIn("临时题", output)
+        self.assertIn("CPU 2000ms", output)
+        self.assertIn("内存 256MiB", output)
+        self.assertNotIn("使用默认限制", output)
+
+    def test_cli_overrides_beat_config(self):
+        (self.root / "config.json").write_text(json.dumps({"time": 2000}))
+        _, output = self._run("--time", "3000")
+        self.assertIn("CPU 3000ms", output)
+
+    def test_missing_dir_is_front_end_error(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = judge.main([str(self.source), "--data-dir", str(self.root / "nope"),
+                               "--no-cgroup"])
+        self.assertEqual(code, 2)
+        self.assertIn("找不到测试点目录", err.getvalue())
+
+    def test_empty_dir_reports_no_cases(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = judge.main([str(self.source), "--data-dir", str(empty), "--no-cgroup"])
+        self.assertEqual(code, 2)
+        self.assertIn("没有配对的 .in/.out", err.getvalue())
+
+    def test_conflicting_arguments_rejected(self):
+        for extra in (["--pid", "1000"], ["--testdata", "x"], ["--list"]):
+            with self.subTest(extra=extra):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                    judge.main([str(self.source), "--data-dir", str(self.data), *extra])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--data-dir", err.getvalue())
+
+    def test_neither_pid_nor_data_dir_errors(self):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            judge.main([str(self.source)])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--data-dir", err.getvalue())
+
+    def test_file_mode_uses_data_parent_for_config(self):
+        # config.json 在 data 的父目录；file 模式的文件名也从那里生效。
+        fdir = self.root / "fileprop"
+        (fdir / "data").mkdir(parents=True)
+        (fdir / "data" / "p1.in").write_text("3 4\n")
+        (fdir / "data" / "p1.out").write_text("7\n")
+        (fdir / "config.json").write_text(json.dumps(
+            {"io": {"mode": "file", "input_file": "apple.in",
+                    "output_file": "apple.out"}}))
+        src = fdir / "sol.cpp"
+        src.write_text(
+            '#include <cstdio>\nint main(){freopen("apple.in","r",stdin);'
+            'freopen("apple.out","w",stdout);long long a,b;'
+            'if(scanf("%lld %lld",&a,&b)!=2)return 1;'
+            'printf("%lld\\n",a+b);return 0;}\n')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([str(src), "--data-dir", str(fdir / "data"), "--no-cgroup"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("IO 文件模式", out.getvalue())
+        self.assertIn("通过 1/1", out.getvalue())
+
+
 class IOConfigTests(unittest.TestCase):
     """第一步：config.json 的 io 配置解析与校验。"""
 

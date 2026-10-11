@@ -578,11 +578,37 @@ python3 judge.py --pid 1000 solution.cpp --time 1000 --memory 256
 python3 judge.py --list
 ```
 
+#### 临时评测：只有一组数据，没有题目编号
+
+不需要 `testData/<pid>/` 这个结构，直接用 `--data-dir` 指向装着 `.in`/`.out` 的目录：
+
+```text
+myprop/
+├── main.cpp
+├── config.json     # 可选；不写就用默认 1000ms / 128MiB / stdio
+└── data/
+    ├── t1.in
+    ├── t1.out
+    └── t2.in
+    └── t2.out
+```
+
+```bash
+python3 judge.py main.cpp --data-dir data
+python3 judge.py main.cpp --data-dir data --time 2000 --memory 256   # 覆盖限制
+```
+
+`--data-dir` 会读 `data` **父目录**下的 `config.json`（所以上图的布局能同时管限制和
+file 模式的文件名）；没找到时使用默认限制，并在输出里明确提示用了默认值。
+`--pid`/`--testdata`/`--list` 与 `--data-dir` 互斥——前者从 `testData` 下拼题号，
+后者直接指定目录，两者混用会在启动时报错。
+
 常用参数：
 
 | 参数 | 说明 |
 |---|---|
 | `--pid <编号>` | 题目编号，对应 `testData/<pid>/data` |
+| `--data-dir <dir>` | 直接指定测试点目录（含 `.in`/`.out`），不需要 pid 与 testData |
 | `--list` | 列出可用题目、测试点数量与限制 |
 | `--testdata <dir>` | 测试数据根目录，默认依次找 `./testData`、`./../testData`、包内 `testData/` |
 | `--time <ms>` / `--memory <MiB>` | 覆盖题目 `config.json` 的 `time` / `memory` |
