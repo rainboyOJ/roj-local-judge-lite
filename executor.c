@@ -377,13 +377,26 @@ static void check_setup(int error_fd) {
 
 /* step 10：helper 的 stdout 就是资源报告，与用户程序的输出分开。 */
 static void print_result(const struct Result *result) {
-  long long cpu_us = ((long long)result->usage.ru_utime.tv_sec + result->usage.ru_stime.tv_sec)
-                    * 1000000 + result->usage.ru_utime.tv_usec + result->usage.ru_stime.tv_usec;
-  printf("{\"timed_out\":%s,\"cpu_time_us\":%lld,\"cpu_time_ms\":%lld,\"real_time_ms\":%lld,"
-         "\"rss_kb\":%ld,\"signal\":%d,\"exit_code\":%d}\n",
-         result->timed_out ? "true" : "false", cpu_us, (cpu_us + 500) / 1000, result->real_time_ms,
-         result->usage.ru_maxrss, WIFSIGNALED(result->status) ? WTERMSIG(result->status) : 0,
-         WIFEXITED(result->status) ? WEXITSTATUS(result->status) : 0);
+  /* step 10：stdout 就是交给 Python 的 JSON 报告，与提交程序的输出分开。
+   * 字段名和数量是双方约定，不能随手增减；Python 侧 ExecutionReport.from_json
+   * 会逐个校验类型，缺字段或类型不符都算执行故障。这里只把每个数的来源
+   * 摆清楚，格式保持一行 JSON。 */
+
+  /* CPU 时间 = 用户态 + 内核态，wait4 给的是「秒 + 微秒」两段。 */
+  long long cpu_us = ((long long)result->usage.ru_utime.tv_sec
+                      + result->usage.ru_stime.tv_sec) * 1000000
+                     + result->usage.ru_utime.tv_usec + result->usage.ru_stime.tv_usec;
+  /* 展示值四舍五入到毫秒；判定用上面的精确微秒，不用这个值。 */
+  long long cpu_ms = (cpu_us + 500) / 1000;
+
+  /* 一个进程只能被信号终结或被正常退出，所以两者最多一个非零。 */
+  int term_signal = WIFSIGNALED(result->status) ? WTERMSIG(result->status) : 0;
+  int exit_code = WIFEXITED(result->status) ? WEXITSTATUS(result->status) : 0;
+
+  printf("{\"timed_out\":%s,\"cpu_time_us\":%lld,\"cpu_time_ms\":%lld,"
+         "\"real_time_ms\":%lld,\"rss_kb\":%ld,\"signal\":%d,\"exit_code\":%d}\n",
+         result->timed_out ? "true" : "false", cpu_us, cpu_ms, result->real_time_ms,
+         result->usage.ru_maxrss, term_signal, exit_code);
 }
 
 /* ── step 01、02、08、09、10 · helper 主流程 ─────────────────────────── */
