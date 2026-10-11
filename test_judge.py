@@ -187,6 +187,146 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(verdict, Verdict.OK)
 
 
+class ExplicitCaseTests(unittest.TestCase):
+    """--case / --case-out：直接给一对文件，不扫目录。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="explicit-case-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.tests = self.root / "tests"
+        self.tests.mkdir()
+        (self.tests / "a.in").write_text("1 2\n")
+        (self.tests / "a.out").write_text("3\n")
+        (self.tests / "b.in").write_text("10 20\n")
+        (self.tests / "b.out").write_text("30\n")
+        self.source = self.root / "main.cpp"
+        self.source.write_text(
+            "#include <cstdio>\nint main(){long long a,b;"
+            "if(scanf(\"%lld %lld\",&a,&b)!=2)return 1;"
+            "printf(\"%lld\\n\",a+b);return 0;}\n")
+
+    def _run(self, *extra):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([str(self.source), "--no-cgroup", *extra])
+        return code, out.getvalue()
+
+    def _run_cli(self, *extra):
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "judge.py"),
+             str(self.source), "--no-cgroup", *extra],
+            capture_output=True, text=True, timeout=120)
+        return proc
+
+    def test_single_case_pairs_by_same_name(self):
+        code, output = self._run("--case", str(self.tests / "a.in"))
+        self.assertEqual(code, 0, output)
+        self.assertIn("通过 1/1", output)
+        self.assertIn("a ", output)      # 测试点名取文件名 stem
+
+    def test_multiple_cases(self):
+        code, output = self._run("--case", str(self.tests / "a.in"),
+                                 "--case", str(self.tests / "b.in"))
+        self.assertEqual(code, 0, output)
+        self.assertIn("通过 2/2", output)
+
+    def test_case_out_pairs_by_order(self):
+        # b.in 配 a.out（内容不对）→ 应为 WA，证明配对按顺序生效。
+        code, output = self._run(
+            "--case", str(self.tests / "a.in"),
+            "--case", str(self.tests / "b.in"),
+            "--case-out", str(self.tests / "a.out"),
+            "--case-out", str(self.tests / "a.out"))
+        self.assertEqual(code, 1)
+        self.assertIn("通过 1/2", output)
+
+    def test_missing_same_name_answer_errors(self):
+        (self.tests / "lonely.in").write_text("1\n")
+        proc = self._run_cli("--case", str(self.tests / "lonely.in"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("没有同名答案", proc.stderr)
+        self.assertIn("--case-out", proc.stderr)
+
+    def test_missing_input_errors(self):
+        proc = self._run_cli("--case", str(self.root / "nope.in"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("找不到输入文件", proc.stderr)
+
+    def test_missing_case_out_target_errors(self):
+        proc = self._run_cli("--case", str(self.tests / "a.in"),
+                             "--case-out", str(self.root / "nope.out"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("找不到答案文件", proc.stderr)
+
+    def test_case_out_count_must_match(self):
+        proc = self._run_cli("--case", str(self.tests / "a.in"),
+                             "--case", str(self.tests / "b.in"),
+                             "--case-out", str(self.tests / "a.out"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("数量必须相同", proc.stderr)
+
+    def test_conflicts_with_other_locators(self):
+        for extra, needle in (
+                (["--data-dir", str(self.tests)], "--data-dir"),
+                (["--pid", "1000"], "--pid"),
+                (["--testdata", str(self.tests)], "--testdata"),
+                (["--list"], "--list")):
+            with self.subTest(extra=extra):
+                proc = self._run_cli("--case", str(self.tests / "a.in"), *extra)
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("--case 与", proc.stderr)
+                self.assertIn(needle, proc.stderr)
+
+    def test_duplicate_names_across_directories_get_suffix(self):
+        other = self.root / "other"
+        other.mkdir()
+        (other / "a.in").write_text("1 2\n")
+        (other / "a.out").write_text("3\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([str(self.source), "--no-cgroup",
+                               "--case", str(self.tests / "a.in"),
+                               "--case", str(other / "a.in")])
+        self.assertEqual(code, 0, out.getvalue())
+        # 两者都过，且名字可区分
+        self.assertIn("通过 2/2", out.getvalue())
+        self.assertIn("a#2", out.getvalue())
+
+    def test_json_output_for_explicit_cases(self):
+        proc = self._run_cli("--output-format", "json",
+                             "--case", str(self.tests / "a.in"),
+                             "--case", str(self.tests / "b.in"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertEqual(data["verdict"], "AC")
+        self.assertEqual([c["name"] for c in data["cases"]], ["a", "b"])
+        self.assertTrue(data["problem"]["temporary"])
+
+    def test_file_mode_with_explicit_case(self):
+        # config.json 取第一个 case 的父目录，file 模式的文件名从那里生效。
+        prop = self.root / "fprop"
+        prop.mkdir()
+        (prop / "apple.in").write_text("3 4\n")
+        (prop / "apple.out").write_text("7\n")
+        (prop / "config.json").write_text(json.dumps(
+            {"io": {"mode": "file", "input_file": "apple.in",
+                    "output_file": "apple.out"}}))
+        src = prop / "sol.cpp"
+        src.write_text(
+            '#include <cstdio>\nint main(){freopen("apple.in","r",stdin);'
+            'freopen("apple.out","w",stdout);long long a,b;'
+            'if(scanf("%lld %lld",&a,&b)!=2)return 1;'
+            'printf("%lld\\n",a+b);return 0;}\n')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = judge.main([str(src), "--no-cgroup",
+                               "--case", str(prop / "apple.in")])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("IO 文件模式", out.getvalue())
+        self.assertIn("通过 1/1", out.getvalue())
+
+
 class OutputFormatTests(unittest.TestCase):
     """--output-format json：stdout 只放 JSON，人类进度走 stderr，退出码不变。"""
 

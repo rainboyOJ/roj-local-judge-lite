@@ -603,12 +603,42 @@ file 模式的文件名）；没找到时使用默认限制，并在输出里明
 `--pid`/`--testdata`/`--list` 与 `--data-dir` 互斥——前者从 `testData` 下拼题号，
 后者直接指定目录，两者混用会在启动时报错。
 
+#### 只评测一个（或几个）数据点
+
+不需要目录结构，直接用 `--case` 指定输入文件：
+
+```bash
+# 单个数据点；答案取同名的 a.out
+python3 judge.py sol.cpp --case tests/a.in
+
+# 答案名字不是 a.out，用 --case-out 按顺序配对
+python3 judge.py sol.cpp --case tests/a.in --case-out tests/a.expected
+
+# 多个数据点
+python3 judge.py sol.cpp --case tests/1.in --case tests/2.in
+python3 judge.py sol.cpp --case tests/1.in --case tests/2.in \
+                     --case-out tests/1.exp --case-out tests/2.exp
+```
+
+规则：
+
+- **配对是自动的**：`--case X.in` 默认取同目录的 `X.out`；只有名字不同才需要
+  `--case-out`。旁边找不到同名答案时报错，并提示用 `--case-out`。
+- **`--case` 与 `--case-out` 数量必须一致**，按出现顺序一一对应；不一致在启动时报错。
+- 测试点名取输入文件的 stem；跨目录重名时自动加 `#2` 后缀。
+- `config.json` 取**第一个** `--case` 所在目录（file 模式的文件名也从那里生效），
+  所以临时目录里放一份 config.json 就能同时管限制与 IO 模式。
+- `--case` 与 `--data-dir`/`--pid`/`--testdata`/`--list` 互斥：前者直接给出清单，
+  后者扫描目录，不做隐式优先级。
+
 常用参数：
 
 | 参数 | 说明 |
 |---|---|
 | `--pid <编号>` | 题目编号，对应 `testData/<pid>/data` |
 | `--data-dir <dir>` | 直接指定测试点目录（含 `.in`/`.out`），不需要 pid 与 testData |
+| `--case <file>` | 直接指定一个输入文件；答案默认取同名 `.out`，可重复 |
+| `--case-out <file>` | 与 `--case` 按顺序配对的答案文件（可选） |
 | `--list` | 列出可用题目、测试点数量与限制 |
 | `--testdata <dir>` | 测试数据根目录，默认依次找 `./testData`、`./../testData`、包内 `testData/` |
 | `--time <ms>` / `--memory <MiB>` | 覆盖题目 `config.json` 的 `time` / `memory` |

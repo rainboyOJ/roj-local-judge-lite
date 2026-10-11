@@ -991,6 +991,43 @@ def list_problems(testdata_root: Path, tried: list[Path], *, json_mode: bool = F
 # --------------------------------------------------------------------------
 
 
+def resolve_explicit_cases(args) -> tuple[Optional[list[tuple[str, Path, Path]]],
+                                          Optional[Path], Optional[str]]:
+    """解析 --case / --case-out，返回 (cases, problem_dir, 错误消息)。
+
+    配对规则：每个 --case 的答案默认取同名 .out；给了 --case-out 时按顺序覆盖。
+    配对由代码保证，不依赖用户把两个列表写对——数量不符在参数校验阶段就报错了。
+
+    测试点名取输入文件的 stem（与目录扫描一致）；多个不同目录混用时取第一个的
+    父目录作为 problem_dir（config.json 与 file 模式的提交文件在那里）。
+    """
+    if not args.cases:
+        return None, None, None
+    cases: list[tuple[str, Path, Path]] = []
+    seen_names: dict[str, int] = {}
+    for index, raw_in in enumerate(args.cases):
+        in_path = raw_in.resolve()
+        if not in_path.is_file():
+            return None, None, f"找不到输入文件：{in_path}"
+        if args.case_outs:
+            out_path = args.case_outs[index].resolve()
+            if not out_path.is_file():
+                return None, None, f"找不到答案文件：{out_path}"
+        else:
+            out_path = in_path.with_suffix(".out")
+            if not out_path.is_file():
+                return None, None, (
+                    f"{in_path} 旁边没有同名答案 {out_path.name}；"
+                    "请补上该文件，或显式用 --case-out 指定答案")
+        # 跨目录可能重名；加序号后缀让显示与 JSON 都能区分。
+        name = in_path.stem
+        seen_names[name] = seen_names.get(name, 0) + 1
+        if seen_names[name] > 1:
+            name = f"{name}#{seen_names[name]}"
+        cases.append((name, in_path, out_path))
+    return cases, cases[0][1].parent, None
+
+
 def locate_problem(args, testdata_root: Optional[Path], tried: list[Path]
                    ) -> tuple[Optional[Path], Optional[Path], Optional[str], bool]:
     """定位测试点目录与题目目录，返回 (data_dir, problem_dir, 错误消息, 是否临时)。
@@ -1034,6 +1071,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, default=None,
                         help="直接指定测试点目录（含配对的 .in/.out），跳过 --pid/--testdata；"
                              "附近的 config.json 仍会被读取")
+    parser.add_argument("--case", dest="cases", action="append", type=Path, metavar="FILE",
+                        help="直接指定一个输入文件，可重复；答案默认取同名 .out，"
+                             "否则按顺序用 --case-out")
+    parser.add_argument("--case-out", dest="case_outs", action="append", type=Path,
+                        metavar="FILE", help="与 --case 按顺序配对的答案文件")
     parser.add_argument("--lang", choices=("auto", "cpp", "python"), default="auto",
                         help="提交语言，默认按后缀判断")
     parser.add_argument("--testdata", type=Path, default=None,
@@ -1067,6 +1109,15 @@ def check_argument_combinations(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--data-dir 已经指定了测试点目录，不再需要 --testdata")
     if args.data_dir is not None and args.list:
         parser.error("--list 用于列出 --testdata 下的题目，与 --data-dir 不兼容")
+    if args.cases:
+        # --case 直接给出测试点清单，与另外三种“扫描目录”的定位方式互斥。
+        for other, name in ((args.pid, "--pid"), (args.data_dir, "--data-dir"),
+                            (args.testdata, "--testdata"), (args.list, "--list")):
+            if other:
+                parser.error(f"--case 与 {name} 只能选一个：--case 已经直接给出测试点")
+        if args.case_outs and len(args.case_outs) != len(args.cases):
+            parser.error(f"--case-out 有 {len(args.case_outs)} 个，--case 有 {len(args.cases)} 个；"
+                         "两者数量必须相同（按顺序配对）")
 
 
 def resolve_checker(spec: str) -> tuple[Optional[Path], str]:
@@ -1501,29 +1552,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     if lang is None:
         return emit_error_report("ERROR", error, json_mode=json_mode, source=str(source))
 
-    # 两种定位方式互斥；都没给时报错并提示两种用法。
-    if args.data_dir is None and not args.pid:
+    # 三种定位方式互斥，都没给时报错并列出可选用法。
+    if args.cases is None and args.data_dir is None and not args.pid:
         parser.error("请用 --pid 指定题目编号（配合 --testdata），"
-                     "或直接用 --data-dir 指定测试点目录")
-    testdata_root, tried = (resolve_testdata(args.testdata) if args.data_dir is None
-                            else (None, []))
-    data_dir, problem_dir, locate_error, temporary = locate_problem(
-        args, testdata_root, tried)
-    if locate_error is not None:
-        return emit_error_report("ERROR", locate_error, json_mode=json_mode,
-                                 source=str(source))
-    if not data_dir.is_dir():
-        hint = (f"可用题目：{', '.join(p.name for p in sorted(testdata_root.iterdir()))}"
-                if testdata_root is not None and testdata_root.is_dir() else "")
-        return emit_error_report("ERROR", f"找不到测试数据：{data_dir}。{hint}",
-                                 json_mode=json_mode, source=str(source),
-                                 label=str(problem_dir.name if temporary else args.pid))
-    cases = load_cases(data_dir)
-    if not cases:
-        return emit_error_report(
-            "ERROR", f"{data_dir} 下没有配对的 .in/.out 测试点",
-            json_mode=json_mode, source=str(source),
-            label=str(problem_dir.name if temporary else args.pid))
+                     "用 --data-dir 指定测试点目录，"
+                     "或用 --case 指定单个输入文件")
+    if args.cases is not None:
+        # --case：测试点清单已确定，不扫目录。
+        cases, problem_dir, locate_error = resolve_explicit_cases(args)
+        if locate_error is not None:
+            return emit_error_report("ERROR", locate_error, json_mode=json_mode,
+                                     source=str(source))
+        temporary = True
+        data_dir = problem_dir
+    else:
+        testdata_root, tried = (resolve_testdata(args.testdata) if args.data_dir is None
+                                else (None, []))
+        data_dir, problem_dir, locate_error, temporary = locate_problem(
+            args, testdata_root, tried)
+        if locate_error is not None:
+            return emit_error_report("ERROR", locate_error, json_mode=json_mode,
+                                     source=str(source))
+        if not data_dir.is_dir():
+            hint = (f"可用题目：{', '.join(p.name for p in sorted(testdata_root.iterdir()))}"
+                    if testdata_root is not None and testdata_root.is_dir() else "")
+            return emit_error_report("ERROR", f"找不到测试数据：{data_dir}。{hint}",
+                                     json_mode=json_mode, source=str(source),
+                                     label=str(problem_dir.name if temporary else args.pid))
+        cases = load_cases(data_dir)
+        if not cases:
+            return emit_error_report(
+                "ERROR", f"{data_dir} 下没有配对的 .in/.out 测试点",
+                json_mode=json_mode, source=str(source),
+                label=str(problem_dir.name if temporary else args.pid))
 
     has_config = (problem_dir / "config.json").is_file()
     title, time_ms, memory_mb = "", 1000, 128
