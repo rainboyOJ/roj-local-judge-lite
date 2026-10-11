@@ -336,7 +336,8 @@ class ExecutorArgumentTests(unittest.TestCase):
         proc = self._run(args)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.output.read_text(), "3 4\n")
-        self.assertIn('"exit_code":0', proc.stdout)
+        # 断言解析后的字段，不绑定具体排版（现在是一字段一行）。
+        self.assertEqual(json.loads(proc.stdout)["exit_code"], 0)
 
     def test_missing_required_option_exits_125(self):
         proc = self._run(self._base(**{"--cwd": None}) + ["--", "/bin/true"])
