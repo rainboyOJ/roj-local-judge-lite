@@ -616,6 +616,57 @@ file 模式的文件名）；没找到时使用默认限制，并在输出里明
 | `--checker auto\|none\|<path>` | 输出比较器，默认 `auto` |
 | `--no-cgroup` | 跳过 cgroup，直接走降级模式 |
 | `--keep-work-dir` | 保留临时工作目录，便于查看输出和编译日志 |
+| `--output-format text\|json` | 结果输出格式；`json` 便于程序/AI 读取，stdout 只放 JSON |
+
+### 给程序/AI 读的输出（`--output-format json`）
+
+`json` 模式下 **stdout 只有一份 JSON**，人看的进度信息（题目、编译、逐点）全部走
+stderr。所以可以直接拿：
+
+```bash
+python3 judge.py --pid 1000 --data-dir data --output-format json sol.cpp \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["verdict"], d["passed"])'
+```
+
+结构（节选）：
+
+```json
+{
+  "verdict": "WA",              // 汇总：AC/WA/TLE/MLE/RE/SE/CE/ERROR
+  "exit_code": 1,               // 给 shell 判断，与文本模式一致
+  "passed": 8, "total": 10, "elapsed_s": 0.05,
+  "problem": {"label": "1000", "title": "A+B问题", "temporary": false},
+  "source": {"path": ".../sol.cpp", "lang": "cpp"},
+  "limits": {"time_ms": 1000, "memory_mib": 128, "wall_ms": 1500},
+  "io_mode": "stdio",
+  "compile": {"ok": true, "output": ""},
+  "isolation": {"mode": "cgroup", "detail": "/sys/fs/cgroup/..."},
+  "cases": [
+    {"verdict": "WA", "name": "problem9",
+     "message": "第 1 行：期望 294777，实际 294778",
+     "cpu_time_us": 1592, "cpu_time_ms": 2, "real_time_ms": 2,
+     "memory_peak_bytes": 524288, "memory_kb": 512, "rss_kb": 3072,
+     "oom_events": 0, "oom_kills": 0,
+     "timed_out": false, "signal": 0, "exit_code": 0}
+  ]
+}
+```
+
+几处刻意的选择：
+
+- **精确值与展示值都给**：判定用的是 `cpu_time_us` / `memory_peak_bytes`，
+  调用方应拿这两个复核，不要用四舍五入后的 `cpu_time_ms` / `memory_kb`。
+- **`memory_peak_bytes` 可能是 `null`**：没有 cgroup 时内存未被测量。
+  `null` 与 `0` 含义不同，不要当成“用量 0”。
+- **`isolation.mode` 必看**：为 `degraded` 时 MLE 永远不出现，
+  不能把“没有 MLE”读成“内存没问题”。
+- **日志/答案路径也给**（`output_path` / `stderr_path`），配合 `--keep-work-dir`
+  可以定位到具体文件。
+- **前置错误也有 JSON**（找不到数据、配置错等）：`{"verdict": "ERROR", "error": "..."}`。
+  只有 argparse 的用法错误（参数写错）仍走中文 stderr。
+- **退出码不变**：0 全 AC / 1 有非 AC / 2 前置或编译错误 / 130 取消。
+
+`--list --output-format json` 也会输出 `{testdata, problems[]}`，方便先查有哪些题目。
 
 ### judge.py 执行逻辑
 

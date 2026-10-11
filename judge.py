@@ -622,6 +622,8 @@ class CaseResult:
 
     output_path: str = ""
     stderr_path: str = ""
+    name: str = ""
+    """测试点名（如 problem1）；由 judge_submission 填入，用于展示与序列化。"""
     cleanup_failed: bool = False
     """进程/cgroup 收尾是否失败；失败时调用方应保留测试点目录供排查。"""
 
@@ -659,10 +661,26 @@ class CaseResult:
         return (self.memory.peak_bytes + 1023) // 1024 if self.memory else 0
 
     def to_dict(self) -> Dict[str, object]:
-        """序列化；verdict 与对象一致，不会出现两套表示。"""
+        """序列化一个测试点；verdict 与对象一致，不会出现两套表示。
+
+        精确值（cpu_time_us / memory_peak_bytes）与展示值都给：判定用的是精确值，
+        调用方（包括 AI）需要能复核，不能只拿到四舍五入后的数字。
+        """
         return {
             "verdict": self.verdict.value,
+            "name": self.name,
             "message": self.message,
+            "cpu_time_us": self.cpu_time_us,
+            "cpu_time_ms": self.cpu_time_ms,
+            "real_time_ms": self.real_time_ms,
+            "memory_peak_bytes": self.memory.peak_bytes if self.memory else None,
+            "memory_kb": self.memory_kb,
+            "rss_kb": self.rss_kb,
+            "oom_events": self.memory.oom_events if self.memory else None,
+            "oom_kills": self.memory.oom_kills if self.memory else None,
+            "timed_out": self.timed_out,
+            "signal": self.signal,
+            "exit_code": self.exit_code,
             "output_path": self.output_path,
             "stderr_path": self.stderr_path,
         }
@@ -941,18 +959,30 @@ def describe(result: CaseResult) -> str:
     return result.message
 
 
-def list_problems(testdata_root: Path, tried: list[Path]) -> int:
+def list_problems(testdata_root: Path, tried: list[Path], *, json_mode: bool = False) -> int:
     if not testdata_root.is_dir():
         return report_missing_testdata(tried)
-    print(f"测试数据目录：{testdata_root}")
+    problems = []
     for problem_dir in sorted(testdata_root.iterdir(), key=lambda p: _natural_key(p.name)):
         if not problem_dir.is_dir():
             continue
         data_dir = problem_dir / "data"
         count = len(load_cases(data_dir)) if data_dir.is_dir() else 0
         title, time_ms, memory_mb, io_config = load_problem_config(problem_dir)
-        mode_note = f"  {io_config.mode}" if io_config.is_file_mode else ""
-        print(f"  {problem_dir.name:<8} {count:>3} 个测试点  {time_ms}ms / {memory_mb}MiB{ mode_note }  {title}")
+        problems.append({
+            "pid": problem_dir.name, "title": title, "cases": count,
+            "time_ms": time_ms, "memory_mib": memory_mb, "io_mode": io_config.mode,
+        })
+    if json_mode:
+        json.dump({"testdata": str(testdata_root), "problems": problems},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    print(f"测试数据目录：{testdata_root}")
+    for item in problems:
+        mode_note = f"  {item['io_mode']}" if item["io_mode"] != "stdio" else ""
+        print(f"  {item['pid']:<8} {item['cases']:>3} 个测试点  "
+              f"{item['time_ms']}ms / {item['memory_mib']}MiB{mode_note}  {item['title']}")
     return 0
 
 
@@ -962,28 +992,30 @@ def list_problems(testdata_root: Path, tried: list[Path]) -> int:
 
 
 def locate_problem(args, testdata_root: Optional[Path], tried: list[Path]
-                   ) -> tuple[Optional[Path], Optional[Path], int, bool]:
-    """定位测试点目录与题目目录，返回 (data_dir, problem_dir, 退出码, 是否临时)。
+                   ) -> tuple[Optional[Path], Optional[Path], Optional[str], bool]:
+    """定位测试点目录与题目目录，返回 (data_dir, problem_dir, 错误消息, 是否临时)。
 
     两种来源，互斥：
       --data-dir D   直接用 D；题目目录取 D 的父目录（config.json 与 file
                      模式的提交文件都在那里），不需要 pid 与 testData。
       --pid N        在 testData 根目录下拼出 X/N/data 与 X/N。
 
-    返回的退出码：成功为 0；已打印错误时为非零，调用方直接返回即可。
+    不在这里打印：错误消息交回调用方，以便按输出格式决定呈现方式。
     """
     if args.data_dir is not None:
         data_dir = args.data_dir.resolve()
         if not data_dir.is_dir():
-            print(f"找不到测试点目录：{data_dir}", file=sys.stderr)
-            return None, None, 2, True
-        return data_dir, data_dir.parent, 0, True
+            return None, None, f"找不到测试点目录：{data_dir}", True
+        return data_dir, data_dir.parent, None, True
 
-    # 查找失败会返回 None；先给出尝试过的目录，再退出，不能直接拼接题号。
+    # 查找失败时把尝试过的路径列进消息，不直接拼接题号。
     if testdata_root is None:
-        return None, None, report_missing_testdata(tried), False
+        listing = "；".join(str(p) for p in tried)
+        return None, None, (
+            f"找不到测试数据目录，已尝试：{listing}。"
+            "请用 --testdata 指定，或把题目数据放在当前目录的 testData/ 下。"), False
     problem_dir = testdata_root / args.pid
-    return problem_dir / "data", problem_dir, 0, False
+    return problem_dir / "data", problem_dir, None, False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1021,6 +1053,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="跳过 cgroup，直接用降级模式（只限 wall 和 CPU）")
     parser.add_argument("--keep-work-dir", action="store_true",
                         help="保留临时工作目录，便于查看输出和编译日志")
+    parser.add_argument("--output-format", choices=("text", "json"), default="text",
+                        help="结果输出格式；json 便于程序/AI 读取（stdout 只放 JSON）")
     parser.add_argument("--list", action="store_true", help="列出 testData 下可用的题目后退出")
     return parser
 
@@ -1208,13 +1242,118 @@ def execute_program(run_argv: list[str], input_path: Path, output_path: Path,
     )
 
 
+@dataclasses.dataclass
+class SubmissionResult:
+    """一份提交的完整评测结果；文本与 JSON 两种输出渲染的都是它。
+
+    把所有信息集中到这里，是为了让“终端看到的”和“JSON 里的”永远是同一份
+    数据——否则很容易出现文本显示了某个字段、JSON 里却没带上。
+    """
+
+    verdict: str
+    """汇总判定：第一个非 AC 的测试点结果；全 AC 时为 "AC"；编译失败为 "CE"。"""
+
+    exit_code: int
+    """给 shell 用的退出码（0 全 AC / 1 有非 AC / 2 前置或编译错误）。"""
+
+    cases: list[CaseResult] = dataclasses.field(default_factory=list)
+    passed: int = 0
+    total: int = 0
+    elapsed_s: float = 0.0
+
+    problem_label: str = ""
+    """题目标识：有 pid 时是编号，临时评测时是目录名。"""
+
+    problem_title: str = ""
+    temporary: bool = False
+    source_path: str = ""
+    lang: str = ""
+    time_ms: int = 0
+    memory_mib: int = 0
+    wall_ms: int = 0
+    io_mode: str = "stdio"
+
+    compile_ok: bool = True
+    compile_output: str = ""
+
+    isolation_mode: str = "cgroup"
+    """cgroup / degraded；degraded 时 MLE 永远不出现，不能当作“内存没问题”。"""
+    isolation_detail: str = ""
+
+    work_dir: str = ""
+    retained_dirs: list[str] = dataclasses.field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, object]:
+        """给程序/AI 读的完整结构；字段名与含义见 docstring。"""
+        return {
+            "verdict": self.verdict,
+            "exit_code": self.exit_code,
+            "passed": self.passed,
+            "total": self.total,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "problem": {
+                "label": self.problem_label,
+                "title": self.problem_title,
+                "temporary": self.temporary,
+            },
+            "source": {"path": self.source_path, "lang": self.lang},
+            "limits": {
+                "time_ms": self.time_ms,
+                "memory_mib": self.memory_mib,
+                "wall_ms": self.wall_ms,
+            },
+            "io_mode": self.io_mode,
+            "compile": {"ok": self.compile_ok, "output": self.compile_output},
+            "isolation": {"mode": self.isolation_mode, "detail": self.isolation_detail},
+            "work_dir": self.work_dir,
+            "retained_dirs": list(self.retained_dirs),
+            "cases": [case.to_dict() for case in self.cases],
+        }
+
+
+class SubmissionError(Exception):
+    """能在提交层面形成结论、但未进入测试点循环的前置错误（找不到数据等）。
+
+    与 argparse 的用法错误区分：用法错误让 argparse 自己报中文并退出 2；
+    本异常带结构化字段，json 输出模式下能渲染成一份带 error 的报告。
+    """
+
+    def __init__(self, message: str, *, verdict: str = "ERROR"):
+        super().__init__(message)
+        self.message = message
+        self.verdict = verdict
+
+
+def emit_error_report(verdict: str, message: str, *, json_mode: bool,
+                      source: str = "", label: str = "") -> int:
+    """前置错误（找不到数据、配置错、executor 缺失等）的统一出口。
+
+    这些错误已经能形成“这次评测没能开始”的结论，所以 json 模式下也给出
+    一份结构化的报告（verdict = ERROR/CE，带 error 字段），让调用方不必
+    区分“stdout 是 JSON”和“stdout 是中文错误”两种情况。
+
+    argparse 的用法错误不走这里：那是“命令写错了”，由 argparse 自己
+    报中文并退出 2。
+    """
+    if json_mode:
+        json.dump({"verdict": verdict, "exit_code": 2, "error": message,
+                   "source": {"path": source}, "problem": {"label": label}},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    print(message, file=sys.stderr)
+    return 2
+
+
 def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]],
                      limits: Limits, *, checker: Optional[Path],
                      cgroup_root: Path, isolated: bool,
                      keep_work_dir: bool = False,
                      io_config: Optional[case_io.IOConfig] = None,
                      drop_privileges: Optional[bool] = None,
-                     run_uid: int = 65534, run_gid: int = 65534) -> int:
+                     run_uid: int = 65534, run_gid: int = 65534,
+                     problem_label: str = "", problem_title: str = "",
+                     temporary: bool = False,
+                     progress_stream=None) -> SubmissionResult:
     """一份提交的完整评测：管理工作目录，编译一次，逐点执行，汇总并清理。
 
     资源边界：工作目录在进入后立即创建，并在 finally 里清理（除非
@@ -1222,10 +1361,21 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
     每个测试点有独立的运行目录（见 case_io.prepare_case_files）；
     单点的进程/cgroup 生命周期在 judge_case 里。
 
-    返回 CLI 退出码：全部 AC 为 0，有非 AC 为 1，编译失败为 2。
+    返回 SubmissionResult；它带 exit_code，调用方直接拿它退进程即可。
+    进度信息写到 progress_stream（默认 stderr）：text 模式下调用方把
+    结果再渲染到 stdout，json 模式下 stdout 只放 JSON。
     """
+    progress = progress_stream if progress_stream is not None else sys.stderr
     io_config = io_config or case_io.IOConfig()
     drop = case_io.resolve_drop_privileges(drop_privileges, run_uid)
+    result = SubmissionResult(
+        verdict="AC", exit_code=0, total=len(cases),
+        problem_label=problem_label, problem_title=problem_title,
+        temporary=temporary, source_path=str(source), lang=lang,
+        time_ms=limits.time_ms, memory_mib=limits.memory_kb // 1024,
+        wall_ms=limits.resolved_wall_ms(), io_mode=io_config.mode,
+        isolation_mode="cgroup" if isolated else "degraded",
+    )
     work_dir = Path(tempfile.mkdtemp(prefix="local-judge-"))
     retained_case_dirs: list[Path] = []
     try:
@@ -1237,13 +1387,16 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
         # 编译一次，之后所有测试点复用同一个产物。
         run_argv, compile_output = compile_submission(lang, source, work_dir)
         if run_argv is None:
-            print("编译失败（CE）：")
-            print(compile_output or "（编译器没有输出）")
-            return 2
-        print("编译通过")
+            result.verdict = "CE"
+            result.exit_code = 2
+            result.compile_ok = False
+            result.compile_output = compile_output
+            print("编译失败（CE）：", file=progress)
+            print(compile_output or "（编译器没有输出）", file=progress)
+            return result
+        print("编译通过", file=progress)
 
         started = time.monotonic()
-        verdicts: list[str] = []
         for index, (name, input_path, expected_path) in enumerate(cases, start=1):
             # 准备失败（权限、磁盘等）记为 SE，继续下一点，与现有循环策略一致。
             try:
@@ -1251,14 +1404,17 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
                     work_dir, index, input_path, io_config,
                     drop=drop, run_uid=run_uid, run_gid=run_gid)
             except OSError as exc:
-                verdicts.append("SE")
-                print(f"  #{index:<3} {name:<12} {'SE':<6}   准备测试点目录失败：{exc}")
+                case = CaseResult(verdict=Verdict.SE, name=name,
+                                  message=f"准备测试点目录失败：{exc}")
+                result.cases.append(case)
+                print(f"  #{index:<3} {name:<12} {'SE':<6}   准备测试点目录失败：{exc}",
+                      file=progress)
                 continue
             # 准备成功立即进入清理边界，中间不插入可能失败的操作。
             # result 用 sentinel 初始化：judge_case 抛异常时仍能正确处理目录。
-            result = None
+            case = None
             try:
-                result = judge_case(
+                case = judge_case(
                     run_argv, files.stdin_path, expected_path, limits,
                     work_dir=work_dir, index=index, checker=checker,
                     cgroup_root=cgroup_root, isolated=isolated,
@@ -1275,35 +1431,41 @@ def judge_submission(source: Path, lang: str, cases: list[tuple[str, Path, Path]
                 raise
             finally:
                 # 进程/cgroup 清理失败时保留目录，否则诊断会丢失。
-                # result 为 None（异常路径）时已在上面处理。
-                if result is not None:
-                    if result.cleanup_failed:
+                # case 为 None（异常路径）时已在上面处理。
+                if case is not None:
+                    if case.cleanup_failed:
                         retained_case_dirs.append(files.cwd)
                         print(f"  ⚠ 测试点 {index} 收尾失败，保留目录：{files.cwd}",
-                              file=sys.stderr)
+                              file=progress)
                     elif not keep_work_dir:
                         shutil.rmtree(files.cwd, ignore_errors=True)
-            verdicts.append(result.verdict.value)
-            print(format_case_line(index, name, result))
+            case.name = name
+            result.cases.append(case)
+            print(format_case_line(index, name, case), file=progress)
 
         # 计时口径保持为“测试点执行阶段”，不含编译时间。
-        elapsed = time.monotonic() - started
-        passed = verdicts.count("AC")
+        result.elapsed_s = time.monotonic() - started
+        verdicts = [c.verdict.value for c in result.cases]
+        result.passed = verdicts.count("AC")
         # 汇总取第一个非 AC 的结果，便于一眼看到“卡在哪一步”。
-        overall = next((v for v in verdicts if v != "AC"), "AC")
-        print()
-        print(f"结果：{overall}  通过 {passed}/{len(cases)}  用时 {elapsed:.2f}s")
+        result.verdict = next((v for v in verdicts if v != "AC"), "AC")
+        result.exit_code = 0 if result.verdict == "AC" else 1
+        print(file=progress)
+        print(f"结果：{result.verdict}  通过 {result.passed}/{result.total}  "
+              f"用时 {result.elapsed_s:.2f}s", file=progress)
         if keep_work_dir:
-            print(f"工作目录：{work_dir}")
-        return 0 if overall == "AC" else 1
+            result.work_dir = str(work_dir)
+            print(f"工作目录：{work_dir}", file=progress)
+        return result
     finally:
         # 与 judge_case 的进程/cgroup 清理各管一类资源。
         # 有测试点因收尾失败而保留目录时，外层也不整棵删，
         # 否则刚保留的诊断会被一并抹掉。
+        result.retained_dirs = [str(p) for p in retained_case_dirs]
         if not keep_work_dir and not retained_case_dirs:
             shutil.rmtree(work_dir, ignore_errors=True)
         elif not keep_work_dir:
-            print(f"  ⚠ 因收尾失败保留工作目录：{work_dir}", file=sys.stderr)
+            print(f"  ⚠ 因收尾失败保留工作目录：{work_dir}", file=progress)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1313,6 +1475,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     check_argument_combinations(parser, args)
+    json_mode = args.output_format == "json"
 
     # ── `--in-scope`：在 systemd-run 建立的 scope 里准备委派父目录，然后继续 ──
     #    不再 exec 第二个自己：当前进程就是要跑评测的那个，准备只是前置步骤。
@@ -1324,19 +1487,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ── step 02 · 解析参数、定位测试数据、读题目限制 ──────────────────────
     if args.list:
         testdata_root, tried = resolve_testdata(args.testdata)
-        return list_problems(testdata_root, tried) if testdata_root else report_missing_testdata(tried)
+        return list_problems(testdata_root, tried, json_mode=json_mode) \
+            if testdata_root else report_missing_testdata(tried)
 
     if args.source is None:
         parser.error("请提供提交源文件，例如：python3 judge.py --pid 1000 solution.cpp")
 
     source = args.source.resolve()
     if not source.is_file():
-        print(f"提交文件不存在：{source}", file=sys.stderr)
-        return 2
+        return emit_error_report("ERROR", f"提交文件不存在：{source}",
+                                 json_mode=json_mode, source=str(source))
     lang, error = detect_language(source, args.lang)
     if lang is None:
-        print(error, file=sys.stderr)
-        return 2
+        return emit_error_report("ERROR", error, json_mode=json_mode, source=str(source))
 
     # 两种定位方式互斥；都没给时报错并提示两种用法。
     if args.data_dir is None and not args.pid:
@@ -1344,18 +1507,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                      "或直接用 --data-dir 指定测试点目录")
     testdata_root, tried = (resolve_testdata(args.testdata) if args.data_dir is None
                             else (None, []))
-    data_dir, problem_dir, code, temporary = locate_problem(args, testdata_root, tried)
-    if code != 0:
-        return code
+    data_dir, problem_dir, locate_error, temporary = locate_problem(
+        args, testdata_root, tried)
+    if locate_error is not None:
+        return emit_error_report("ERROR", locate_error, json_mode=json_mode,
+                                 source=str(source))
     if not data_dir.is_dir():
-        print(f"找不到测试数据：{data_dir}", file=sys.stderr)
-        print(f"可用题目：{', '.join(p.name for p in sorted(testdata_root.iterdir()))}"
-              if testdata_root is not None and testdata_root.is_dir() else "", file=sys.stderr)
-        return 2
+        hint = (f"可用题目：{', '.join(p.name for p in sorted(testdata_root.iterdir()))}"
+                if testdata_root is not None and testdata_root.is_dir() else "")
+        return emit_error_report("ERROR", f"找不到测试数据：{data_dir}。{hint}",
+                                 json_mode=json_mode, source=str(source),
+                                 label=str(problem_dir.name if temporary else args.pid))
     cases = load_cases(data_dir)
     if not cases:
-        print(f"{data_dir} 下没有配对的 .in/.out 测试点", file=sys.stderr)
-        return 2
+        return emit_error_report(
+            "ERROR", f"{data_dir} 下没有配对的 .in/.out 测试点",
+            json_mode=json_mode, source=str(source),
+            label=str(problem_dir.name if temporary else args.pid))
 
     has_config = (problem_dir / "config.json").is_file()
     title, time_ms, memory_mb = "", 1000, 128
@@ -1363,8 +1531,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         title, time_ms, memory_mb, io_config = load_problem_config(problem_dir)
     except case_io.IOConfigError as exc:
         # 配置错误在编译前退出：不浪费一次编译，也不产生测试点输出。
-        print(f"题目配置错误（{problem_dir / 'config.json'}）：{exc}", file=sys.stderr)
-        return 2
+        return emit_error_report(
+            "ERROR", f"题目配置错误（{problem_dir / 'config.json'}）：{exc}",
+            json_mode=json_mode, source=str(source),
+            label=str(problem_dir.name if temporary else args.pid))
     if args.time is not None:
         time_ms = args.time
     if args.memory is not None:
@@ -1394,42 +1564,59 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         reason = f"{reason}；自动委派不可用（{delegate_reason}）"
 
+    # json 模式下 stdout 只放最终 JSON；人类进度信息全部走 stderr。
+    progress = sys.stderr if json_mode else sys.stdout
+
     if temporary:
         # 临时评测：没有 pid，题目名就用目录名；无 config.json 时用默认限制。
         label = problem_dir.name or str(problem_dir)
-        print(f"题目 {label}（临时：{data_dir}）" + (f"  {title}" if title else ""))
+        print(f"题目 {label}（临时：{data_dir}）" + (f"  {title}" if title else ""),
+              file=progress)
         if not has_config:
-            print(f"  未找到 {problem_dir / 'config.json'}，使用默认限制（可用 --time/--memory 覆盖）")
+            print(f"  未找到 {problem_dir / 'config.json'}，使用默认限制（可用 --time/--memory 覆盖）",
+                  file=progress)
     else:
-        print(f"题目 {args.pid}" + (f"  {title}" if title else ""))
-    print(f"提交 {source.name}（{lang}）")
-    print(f"限制 CPU {time_ms}ms / 内存 {memory_mb}MiB / wall {limits.resolved_wall_ms()}ms")
+        label = args.pid
+        print(f"题目 {args.pid}" + (f"  {title}" if title else ""), file=progress)
+    print(f"提交 {source.name}（{lang}）", file=progress)
+    print(f"限制 CPU {time_ms}ms / 内存 {memory_mb}MiB / wall {limits.resolved_wall_ms()}ms",
+          file=progress)
     if io_config.is_file_mode:
-        print(f"IO 文件模式：输入 {io_config.input_file} / 输出 {io_config.output_file}")
+        print(f"IO 文件模式：输入 {io_config.input_file} / 输出 {io_config.output_file}",
+              file=progress)
     else:
-        print("IO 标准流模式")
+        print("IO 标准流模式", file=progress)
     if isolated:
-        print(f"执行 cgroup 隔离，root={cgroup_root}")
+        print(f"执行 cgroup 隔离，root={cgroup_root}", file=progress)
         # 不降权时提交与 judge 同身份，可以写自己 case 组的 memory.max。
         # 这在本地自查里无所谓，但要让人知道 MLE 不是防篡改的。
         if not case_io.resolve_drop_privileges(None, 65534) and os.geteuid() != 0:
-            print("  ⚠ 未降权：提交与 judge 同身份，可修改自己的 cgroup 限制；MLE 不可防篡改")
+            print("  ⚠ 未降权：提交与 judge 同身份，可修改自己的 cgroup 限制；MLE 不可防篡改",
+                  file=progress)
     else:
-        print(f"执行降级模式：{reason}")
+        print(f"执行降级模式：{reason}", file=progress)
         if os.geteuid() == 0:
-            print("  root 想启用隔离：先准备一个委派父目录（详见 README「构建与权限」），例如")
+            print("  root 想启用隔离：先准备一个委派父目录（详见 README「构建与权限」），例如",
+                  file=progress)
             print(f"    mkdir -p {DEFAULT_CGROUP_ROOT} && "
-                  f"echo +memory > {DEFAULT_CGROUP_ROOT}/cgroup.subtree_control")
-        print("  ⚠ 无内存隔离，MLE 无法判定；TLE 依赖 wall 与 RLIMIT_CPU（整秒）")
-    print(f"比较 {checker_note}")
+                  f"echo +memory > {DEFAULT_CGROUP_ROOT}/cgroup.subtree_control", file=progress)
+        print("  ⚠ 无内存隔离，MLE 无法判定；TLE 依赖 wall 与 RLIMIT_CPU（整秒）", file=progress)
+    print(f"比较 {checker_note}", file=progress)
     print()
 
     # ── step 03 · 编译并逐点评测；工作目录与清理由 judge_submission 管理 ──
-    return judge_submission(
+    submission = judge_submission(
         source, lang, cases, limits, checker=checker,
         cgroup_root=cgroup_root, isolated=isolated,
         keep_work_dir=args.keep_work_dir, io_config=io_config,
+        problem_label=label, problem_title=title, temporary=temporary,
+        progress_stream=progress,
     )
+    submission.isolation_detail = str(cgroup_root) if isolated else reason
+    if json_mode:
+        json.dump(submission.to_dict(), sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    return submission.exit_code
 
 
 if __name__ == "__main__":

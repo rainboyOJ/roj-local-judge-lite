@@ -187,6 +187,115 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(verdict, Verdict.OK)
 
 
+class OutputFormatTests(unittest.TestCase):
+    """--output-format json：stdout 只放 JSON，人类进度走 stderr，退出码不变。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="outfmt-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "t1.in").write_text("1 2\n")
+        (self.data / "t1.out").write_text("3\n")
+        self.good = self.root / "good.cpp"
+        self.good.write_text(
+            '#include <cstdio>\nint main(){long long a,b;'
+            'if(scanf("%lld %lld",&a,&b)!=2)return 1;'
+            'printf("%lld\\n",a+b);return 0;}\n')
+        self.bad = self.root / "bad.cpp"
+        self.bad.write_text(
+            '#include <cstdio>\nint main(){long long a,b;'
+            'if(scanf("%lld %lld",&a,&b)!=2)return 1;'
+            'printf("%lld\\n",a+b+1);return 0;}\n')
+        self.broken = self.root / "broken.cpp"
+        self.broken.write_text("int main(){ this is not c++ }\n")
+
+    def _run(self, source, *extra):
+        """跑 CLI，返回 (退出码, stdout, stderr)。"""
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "judge.py"),
+             str(source), "--data-dir", str(self.data), "--no-cgroup", *extra],
+            capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def test_json_stdout_is_pure_json(self):
+        code, out, err = self._run(self.good, "--output-format", "json")
+        self.assertEqual(code, 0, err)
+        # stdout 必须能直接解析，没有任何横幅。
+        data = json.loads(out)
+        self.assertEqual(data["verdict"], "AC")
+        self.assertEqual(data["exit_code"], 0)
+        self.assertEqual(data["passed"], 1)
+        self.assertEqual(data["total"], 1)
+        # 进度信息应在 stderr
+        self.assertIn("编译通过", err)
+
+    def test_json_has_case_facts_and_isolation(self):
+        _, out, _ = self._run(self.good, "--output-format", "json")
+        data = json.loads(out)
+        case = data["cases"][0]
+        self.assertEqual(case["verdict"], "AC")
+        self.assertEqual(case["name"], "t1")
+        for key in ("cpu_time_us", "cpu_time_ms", "real_time_ms", "rss_kb",
+                    "signal", "exit_code", "output_path", "stderr_path"):
+            self.assertIn(key, case)
+        # 无 cgroup 时内存是 None，不是 0——不能把“未测量”说成“用量 0”。
+        self.assertIsNone(case["memory_peak_bytes"])
+        self.assertEqual(data["isolation"]["mode"], "degraded")
+
+    def test_json_wa_carries_message(self):
+        code, out, _ = self._run(self.bad, "--output-format", "json")
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertEqual(data["verdict"], "WA")
+        self.assertEqual(data["cases"][0]["verdict"], "WA")
+        self.assertTrue(data["cases"][0]["message"])
+
+    def test_json_compile_failure(self):
+        code, out, _ = self._run(self.broken, "--output-format", "json")
+        self.assertEqual(code, 2)
+        data = json.loads(out)
+        self.assertEqual(data["verdict"], "CE")
+        self.assertFalse(data["compile"]["ok"])
+        self.assertTrue(data["compile"]["output"])
+        self.assertEqual(data["cases"], [])
+
+    def test_json_front_end_error_is_structured(self):
+        # 找不到 data 目录：也给出 JSON，而不是中文 stderr。
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "judge.py"),
+             str(self.good), "--data-dir", str(self.root / "nope"),
+             "--no-cgroup", "--output-format", "json"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        data = json.loads(proc.stdout)
+        self.assertEqual(data["verdict"], "ERROR")
+        self.assertIn("找不到测试点目录", data["error"])
+
+    def test_text_mode_keeps_human_output_on_stdout(self):
+        code, out, _ = self._run(self.good)
+        self.assertEqual(code, 0)
+        self.assertIn("结果：AC", out)
+        self.assertIn("编译通过", out)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+
+    def test_list_json(self):
+        # 用仓库自带的 testData：--list 的 json 形式是 {testdata, problems[]}。
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "judge.py"),
+             "--list", "--output-format", "json"],
+            capture_output=True, text=True, timeout=60, cwd=str(Path(__file__).resolve().parent))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertIn("testdata", data)
+        self.assertTrue(data["problems"])
+        first = data["problems"][0]
+        for key in ("pid", "title", "cases", "time_ms", "memory_mib", "io_mode"):
+            self.assertIn(key, first)
+
+
 class DataDirModeTests(unittest.TestCase):
     """--data-dir：直接指定测试点目录，不需要 pid/testData/config.json。"""
 
@@ -724,29 +833,6 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
         self.cases = [("problem1", self.data / "problem1.in",
                        self.data / "problem1.out")]
 
-    def _submit(self, **kwargs):
-        """跑一次 judge_submission，并记录它实际创建的 work_dir。
-
-        不用 glob 扫 /tmp：那会把其他测试（或并行进程）同时创建的目录算进来，
-        导致间歇性误报。这里包住 tempfile.mkdtemp，只盯自己的那一个。
-        """
-        created: list[Path] = []
-        real_mkdtemp = tempfile.mkdtemp
-
-        def tracking_mkdtemp(*args, **kw):
-            path = real_mkdtemp(*args, **kw)
-            created.append(Path(path))
-            return path
-
-        with patch.object(judge.tempfile, "mkdtemp", tracking_mkdtemp):
-            code = judge.judge_submission(
-                self.source, "python", self.cases, Limits(),
-                checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
-                **kwargs,
-            )
-        self.assertTrue(created, "judge_submission 应创建临时工作目录")
-        return code, created[0]
-
     def _track_mkdtemp(self):
         """返回 (patcher, 记录列表)：包住 tempfile.mkdtemp，记录创建的路径。"""
         created: list[Path] = []
@@ -767,13 +853,13 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
         """
         patcher, created = self._track_mkdtemp()
         with patcher:
-            code = judge.judge_submission(
+            result = judge.judge_submission(
                 self.source, "python", self.cases, Limits(),
                 checker=None, cgroup_root=self.root / "no-cgroup", isolated=False,
                 **kwargs,
             )
         self.assertEqual(len(created), 1, "judge_submission 应创建一个工作目录")
-        return code, created[0]
+        return result, created[0]
 
     def test_chmod_failure_still_cleans_work_dir(self):
         # 模拟 root 分支：chmod 抛 OSError。目录必须仍被清理，原错误可见。
@@ -808,15 +894,16 @@ class WorkDirCleanupBoundaryTests(unittest.TestCase):
 
     def test_normal_run_cleans_work_dir(self):
         with redirect_stdout(io.StringIO()):
-            exit_code, work = self._submit()
-        self.assertEqual(exit_code, 0)
+            result, work = self._submit()
+        self.assertEqual(result.exit_code, 0)
         self.assertFalse(work.exists(), "正常结束应删掉工作目录")
 
     def test_compile_failure_cleans_work_dir(self):
         self.source.write_text("def broken(:\n")  # 真正无法编译的语法错误
         with redirect_stdout(io.StringIO()):
-            exit_code, work = self._submit()
-        self.assertEqual(exit_code, 2)
+            result, work = self._submit()
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.verdict, "CE")
         self.assertFalse(work.exists(), "编译失败也应删掉工作目录")
 
 
