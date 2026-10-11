@@ -394,16 +394,20 @@ static void print_result(const struct Result *result) {
   int exit_code = WIFEXITED(result->status) ? WEXITSTATUS(result->status) : 0;
 
   /* 一行一个字段，便于人看与 diff；json.loads 对空白不敏感，
-   * Python 侧仍把它当成一份完整的 JSON 报告。 */
-  printf("{\n");
-  printf("  \"timed_out\": %s,\n", result->timed_out ? "true" : "false");
-  printf("  \"cpu_time_us\": %lld,\n", cpu_us);
-  printf("  \"cpu_time_ms\": %lld,\n", cpu_ms);
-  printf("  \"real_time_ms\": %lld,\n", result->real_time_ms);
-  printf("  \"rss_kb\": %ld,\n", result->usage.ru_maxrss);
-  printf("  \"signal\": %d,\n", term_signal);
-  printf("  \"exit_code\": %d\n", exit_code);
-  printf("}\n");
+   * Python 侧仍把它当成一份完整的 JSON 报告。
+   * 用一次 printf 写完：每行格式串与对应参数相邻，不易错位，
+   * 也不会因多次调用在缓冲边界上产生交错。 */
+  printf("{\n"
+         "  \"timed_out\": %s,\n"
+         "  \"cpu_time_us\": %lld,\n"
+         "  \"cpu_time_ms\": %lld,\n"
+         "  \"real_time_ms\": %lld,\n"
+         "  \"rss_kb\": %ld,\n"
+         "  \"signal\": %d,\n"
+         "  \"exit_code\": %d\n"
+         "}\n",
+         result->timed_out ? "true" : "false", cpu_us, cpu_ms, result->real_time_ms,
+         result->usage.ru_maxrss, term_signal, exit_code);
 }
 
 /* ── step 01、02、08、09、10 · helper 主流程 ─────────────────────────── */
